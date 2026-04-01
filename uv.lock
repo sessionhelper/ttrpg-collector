@@ -679,8 +679,8 @@ wheels = [
 
 [[package]]
 name = "py-cord"
-version = "2.8.0rc2.dev28+g7889ca3c8"
-source = { git = "https://github.com/Pycord-Development/pycord.git?rev=fix%2Fvoice-rec-2#7889ca3c8c9dac5a357dc0c0f1404b652aa68afc" }
+version = "2.8.0rc2.dev29+ga98caa4fb"
+source = { git = "https://github.com/sessionhelper/pycord.git?rev=fix%2Fvoice-receive-packet-loss#a98caa4fbeb896d630f2c306acc0e74172d91497" }
 dependencies = [
     { name = "aiohttp" },
     { name = "typing-extensions" },
@@ -987,7 +987,7 @@ dev = [
 requires-dist = [
     { name = "aioboto3", specifier = ">=13.0" },
     { name = "boto3", specifier = ">=1.35" },
-    { name = "py-cord", extras = ["voice"], git = "https://github.com/Pycord-Development/pycord.git?rev=fix%2Fvoice-rec-2" },
+    { name = "py-cord", extras = ["voice"], git = "https://github.com/sessionhelper/pycord.git?rev=fix%2Fvoice-receive-packet-loss" },
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
