@@ -166,7 +166,18 @@ class RecordingCog(commands.Cog):
         # Create recorder and connect
         recorder = VoiceRecorder(session_dir, session.consented_user_ids)
         await recorder.connect(voice_channel)
-        recorder.start_recording(voice_channel_members(voice_channel))
+
+        # Retry start_recording — voice connection may need time to stabilize
+        import asyncio
+
+        for attempt in range(10):
+            try:
+                recorder.start_recording(voice_channel_members(voice_channel))
+                break
+            except Exception:
+                if attempt == 9:
+                    raise
+                await asyncio.sleep(1)
 
         self.recorders[guild_id] = recorder
 
