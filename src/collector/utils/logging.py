@@ -1,27 +1,58 @@
 import logging
-import sys
 
 import structlog
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.theme import Theme
+
+# Muted theme — no flashy colors
+theme = Theme(
+    {
+        "log.time": "dim",
+        "log.level": "bold",
+        "log.message": "",
+        "repr.number": "",
+        "repr.str": "",
+    }
+)
+
+console = Console(theme=theme, stderr=True)
 
 
 def setup_logging(level: str = "INFO") -> None:
-    """Configure structlog with JSON output."""
+    """Configure structlog with rich console output."""
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
+    # Set up stdlib logging with RichHandler for py-cord's internal logs
+    logging.basicConfig(
+        level=log_level,
+        format="%(message)s",
+        datefmt="[%H:%M:%S]",
+        handlers=[RichHandler(console=console, show_path=False, markup=False)],
+        force=True,
+    )
+
+    # Quiet noisy loggers
+    logging.getLogger("discord").setLevel(logging.WARNING)
+    logging.getLogger("discord.gateway").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
+    # Configure structlog to render through rich
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.StackInfoRenderer(),
             structlog.dev.set_exc_info,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.dev.ConsoleRenderer()
-            if sys.stderr.isatty()
-            else structlog.processors.JSONRenderer(),
+            structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+            structlog.dev.ConsoleRenderer(
+                colors=True,
+                pad_event=30,
+            ),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(logging, level.upper(), logging.INFO)
-        ),
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.PrintLoggerFactory(file=console.file),
         cache_logger_on_first_use=True,
     )
 
