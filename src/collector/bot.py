@@ -12,12 +12,18 @@ from collector.utils.logging import setup_logging
 
 log = structlog.get_logger()
 
-# Load opus for voice receive
-if not discord.opus.is_loaded():
-    discord.opus.load_opus("libopus.so.0")
+def _load_opus() -> None:
+    if discord.opus.is_loaded():
+        return
+    try:
+        discord.opus.load_opus("libopus.so.0")
+        log.info("opus_loaded", status=discord.opus.is_loaded())
+    except Exception:
+        log.error("opus_load_failed", exc_info=True)
 
 
 def create_bot() -> commands.Bot:
+    _load_opus()
     intents = discord.Intents.default()
     intents.voice_states = True
     intents.guilds = True
