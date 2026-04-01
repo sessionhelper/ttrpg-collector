@@ -50,9 +50,12 @@ class VoiceRecorder:
         self._recording = True
         log.info("recording_started", user_count=len(self.sink.consented_user_ids))
 
-    async def _on_recording_stopped(self, sink: DiskSink, *args) -> None:
-        """Callback when recording stops (channel empty, etc.)."""
-        log.info("recording_stopped_callback")
+    def _on_recording_stopped(self, exception: Exception | None = None) -> None:
+        """Callback when recording stops."""
+        if exception:
+            log.error("recording_stopped_with_error", error=str(exception))
+        else:
+            log.info("recording_stopped_callback")
 
     def add_mid_session_user(self, member: discord.Member) -> None:
         """Add a user who joined and consented mid-session."""

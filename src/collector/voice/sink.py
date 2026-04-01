@@ -74,11 +74,19 @@ class DiskSink(discord.sinks.Sink):
             log.info("stream_opened", user_id=user_id, path=str(stream.pcm_path))
         return self._streams[user_id]
 
-    def write(self, data: bytes, user: int) -> None:
-        """Called by py-cord for each chunk of decoded PCM audio."""
-        stream = self._get_or_create_stream(user)
+    def write(self, data, user) -> None:
+        """Called by py-cord for each chunk of decoded PCM audio.
+
+        In the DAVE branch, data is a VoiceData object with .pcm bytes,
+        and user is a Member/User object (not an int).
+        """
+        # Handle both old API (bytes, int) and new DAVE API (VoiceData, Member)
+        pcm = data.pcm if hasattr(data, "pcm") else data
+        user_id = user.id if hasattr(user, "id") else user
+
+        stream = self._get_or_create_stream(user_id)
         if stream is not None:
-            stream.write(data)
+            stream.write(pcm)
 
     def add_consented_user(self, user_id: int) -> None:
         """Allow a mid-session joiner to be recorded."""
