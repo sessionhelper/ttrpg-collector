@@ -25,6 +25,7 @@ class UserStream:
     file: object = field(default=None, repr=False)  # IO handle
     bytes_written: int = 0
     part: int = 1
+    _last_seq: int = field(default=-1, repr=False)
 
     def open(self) -> None:
         self.pcm_path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +75,10 @@ class DiskSink(discord.sinks.Sink):
             log.info("stream_opened", user_id=user_id, path=str(stream.pcm_path))
         return self._streams[user_id]
 
+    # PCM frame size: 48kHz * 2 channels * 2 bytes/sample * 20ms = 3840 bytes
+    FRAME_SIZE = 3840
+    SILENCE_FRAME = b"\x00" * FRAME_SIZE
+
     def write(self, data, user) -> None:
         """Called by py-cord for each chunk of decoded PCM audio.
 
@@ -84,9 +89,21 @@ class DiskSink(discord.sinks.Sink):
         pcm = data.pcm if hasattr(data, "pcm") else data
         user_id = user.id if hasattr(user, "id") else user
 
-        stream = self._get_or_create_stream(user_id)
-        if stream is not None:
-            stream.write(pcm)
+        # Track sequence numbers and fill gaps with silence
+        if hasattr(data, "packet"):
+            seq = data.packet.sequence
+            stream = self._get_or_create_stream(user_id)
+            if stream is not None:
+                if hasattr(stream, "_last_seq") and stream._last_seq >= 0:
+                    gap = (seq - stream._last_seq - 1) & 0xFFFF
+                    if 0 < gap < 100:  # reasonable gap, not a wrap-around glitch
+                        stream.write(self.SILENCE_FRAME * gap)
+                stream._last_seq = seq
+                stream.write(pcm)
+        else:
+            stream = self._get_or_create_stream(user_id)
+            if stream is not None:
+                stream.write(pcm)
 
     def add_consented_user(self, user_id: int) -> None:
         """Allow a mid-session joiner to be recorded."""
