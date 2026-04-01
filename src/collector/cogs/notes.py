@@ -77,9 +77,33 @@ class NotesCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    async def _session_autocomplete(self, ctx: discord.AutocompleteContext) -> list[str]:
+        if ctx.interaction.guild is None:
+            return []
+
+        guild_dir = get_buffer_dir() / str(ctx.interaction.guild.id)
+        if not guild_dir.exists():
+            return []
+
+        sessions = []
+        for d in sorted(guild_dir.iterdir(), reverse=True):
+            if d.is_dir() and (d / "meta.json").exists():
+                meta = json.loads((d / "meta.json").read_text())
+                label = d.name[:8]
+                if meta.get("game_system"):
+                    label = f"{meta['game_system']} — {label}"
+                if meta.get("started_at"):
+                    date = meta["started_at"][:10]
+                    label = f"{label} ({date})"
+                sessions.append(discord.OptionChoice(name=label, value=d.name))
+        return sessions[:25]
+
     @discord.slash_command(name="notes", description="Submit session notes for the dataset")
     @discord.option(
-        "session", description="Session to add notes to", required=True
+        "session",
+        description="Session to add notes to",
+        required=True,
+        autocomplete=_session_autocomplete,
     )
     async def notes(self, ctx: discord.ApplicationContext, session: str) -> None:
         if ctx.guild is None:
@@ -101,28 +125,6 @@ class NotesCog(commands.Cog):
 
         modal = NotesModal(session_id=session, session_dir=session_dir, guild_id=guild_id)
         await ctx.send_modal(modal)
-
-    @notes.autocomplete("session")
-    async def session_autocomplete(self, ctx: discord.AutocompleteContext) -> list[str]:
-        if ctx.interaction.guild is None:
-            return []
-
-        guild_dir = get_buffer_dir() / str(ctx.interaction.guild.id)
-        if not guild_dir.exists():
-            return []
-
-        sessions = []
-        for d in sorted(guild_dir.iterdir(), reverse=True):
-            if d.is_dir() and (d / "meta.json").exists():
-                meta = json.loads((d / "meta.json").read_text())
-                label = d.name[:8]
-                if meta.get("game_system"):
-                    label = f"{meta['game_system']} — {label}"
-                if meta.get("started_at"):
-                    date = meta["started_at"][:10]
-                    label = f"{label} ({date})"
-                sessions.append(discord.OptionChoice(name=label, value=d.name))
-        return sessions[:25]
 
 
 def setup(bot: commands.Bot) -> None:
