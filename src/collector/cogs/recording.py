@@ -154,7 +154,9 @@ class RecordingCog(commands.Cog):
         if not quorum:
             self.consent_manager.remove_session(guild_id)
             self.metadata.pop(guild_id, None)
-            await ctx.send("Recording cancelled — consent requirements not met.")
+            text_channel = ctx.guild.get_channel(session.text_channel_id)
+            if text_channel:
+                await text_channel.send("Recording cancelled — consent requirements not met.")
             return
 
         session.state = SessionState.RECORDING
