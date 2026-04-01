@@ -84,8 +84,8 @@ class TestBundleWriting:
         audio_dir = session_dir / "audio"
         audio_dir.mkdir()
 
-        # Create a fake WAV file
-        wav = audio_dir / "12345.wav"
+        # Create a fake audio file
+        wav = audio_dir / "12345.flac"
         wav.write_bytes(b"\x00" * 1024)
 
         bundle = SessionBundle(

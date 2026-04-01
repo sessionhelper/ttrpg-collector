@@ -18,6 +18,7 @@ MULTIPART_THRESHOLD = 100 * 1024 * 1024  # 100MB
 CONTENT_TYPES = {
     ".json": "application/json",
     ".wav": "audio/wav",
+    ".flac": "audio/flac",
     ".md": "text/markdown",
 }
 

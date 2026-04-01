@@ -252,21 +252,21 @@ class RecordingCog(commands.Cog):
         meta.end()
         bundle.ended_at = meta.ended_at
 
-        # Stop recording and convert to WAV
-        wav_paths = await recorder.stop()
+        # Stop recording and convert to FLAC
+        audio_paths = await recorder.stop()
 
         # Rename to pseudonymized filenames
-        wav_paths = bundle.rename_wav_files(wav_paths)
+        audio_paths = bundle.rename_audio_files(audio_paths)
 
         # Compute quality flags
         quality_flags = compute_quality_flags(
             duration_seconds=meta.duration_seconds,
             consented_count=len(session.consented_user_ids),
-            wav_paths=wav_paths,
+            wav_paths=audio_paths,
         )
 
         # Write bundle files
-        bundle.write_meta(session, recorder.stream_manager, wav_paths, quality_flags)
+        bundle.write_meta(session, recorder.stream_manager, audio_paths, quality_flags)
         bundle.write_consent(session)
         bundle.write_pii(session)
 
@@ -275,7 +275,7 @@ class RecordingCog(commands.Cog):
         duration_str = format_duration(meta.duration_seconds)
         await ctx.send(
             f"Recording complete. Duration: {duration_str}, "
-            f"Tracks: {len(wav_paths)}\n"
+            f"Tracks: {len(audio_paths)}\n"
             f"Uploading to storage..."
         )
 

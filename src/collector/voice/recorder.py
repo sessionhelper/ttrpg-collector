@@ -70,14 +70,14 @@ class VoiceRecorder:
         self.stream_manager.user_rejoined(user_id)
 
     async def stop(self) -> list[Path]:
-        """Stop recording and convert PCM to WAV. Returns WAV paths."""
+        """Stop recording and convert PCM to FLAC. Returns FLAC paths."""
         if self.voice_client and self._recording:
             self.voice_client.stop_recording()
             self._recording = False
 
-        wav_paths = await self.sink.convert_to_wav()
-        log.info("recording_finalized", wav_count=len(wav_paths))
-        return wav_paths
+        audio_paths = await self.sink.convert_to_flac()
+        log.info("recording_finalized", track_count=len(audio_paths))
+        return audio_paths
 
     async def disconnect(self) -> None:
         if self.voice_client and self.voice_client.is_connected():
