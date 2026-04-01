@@ -148,40 +148,52 @@ class RecordingCog(commands.Cog):
         voice_channel: discord.VoiceChannel,
         session_id: str,
     ) -> None:
-        quorum = await session.wait_for_quorum()
-        guild_id = ctx.guild.id
-
-        if not quorum:
-            self.consent_manager.remove_session(guild_id)
-            self.metadata.pop(guild_id, None)
-            text_channel = ctx.guild.get_channel(session.text_channel_id)
-            if text_channel:
-                await text_channel.send("Recording cancelled — consent requirements not met.")
-            return
-
-        session.state = SessionState.RECORDING
-
-        # Set up local buffer
-        session_dir = create_session_dir(guild_id, session_id)
-        mark_recording(guild_id, session_id, str(session_dir))
-
-        # Create recorder and connect
-        recorder = VoiceRecorder(session_dir, session.consented_user_ids)
-        await recorder.connect(voice_channel)
-
-        # Retry start_recording — voice connection may need time to stabilize
         import asyncio
 
-        for attempt in range(10):
-            try:
-                recorder.start_recording(voice_channel_members(voice_channel))
-                break
-            except Exception:
-                if attempt == 9:
-                    raise
-                await asyncio.sleep(1)
+        guild_id = ctx.guild.id
+        text_channel = ctx.guild.get_channel(session.text_channel_id)
 
-        self.recorders[guild_id] = recorder
+        try:
+            quorum = await session.wait_for_quorum()
+
+            if not quorum:
+                self.consent_manager.remove_session(guild_id)
+                self.metadata.pop(guild_id, None)
+                if text_channel:
+                    await text_channel.send(
+                        "Recording cancelled — consent requirements not met."
+                    )
+                return
+
+            session.state = SessionState.RECORDING
+
+            # Set up local buffer
+            session_dir = create_session_dir(guild_id, session_id)
+            mark_recording(guild_id, session_id, str(session_dir))
+
+            # Create recorder and connect
+            recorder = VoiceRecorder(session_dir, session.consented_user_ids)
+            await recorder.connect(voice_channel)
+
+            # Retry start_recording — voice connection may need time to stabilize
+            for attempt in range(10):
+                try:
+                    recorder.start_recording(voice_channel_members(voice_channel))
+                    break
+                except Exception:
+                    if attempt == 9:
+                        raise
+                    log.warning("start_recording_retry", attempt=attempt + 1)
+                    await asyncio.sleep(1)
+
+            self.recorders[guild_id] = recorder
+        except Exception:
+            log.error("recording_start_failed", session_id=session_id, exc_info=True)
+            self.consent_manager.remove_session(guild_id)
+            self.metadata.pop(guild_id, None)
+            if text_channel:
+                await text_channel.send("Failed to start recording. Please try again.")
+            return
 
         meta = self.metadata[guild_id]
         bundle = SessionBundle(
