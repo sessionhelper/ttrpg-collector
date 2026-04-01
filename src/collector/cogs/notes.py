@@ -79,7 +79,7 @@ class NotesCog(commands.Cog):
 
     @discord.slash_command(name="notes", description="Submit session notes for the dataset")
     @discord.option(
-        "session", description="Session to add notes to", required=True, autocomplete=True
+        "session", description="Session to add notes to", required=True
     )
     async def notes(self, ctx: discord.ApplicationContext, session: str) -> None:
         if ctx.guild is None:
