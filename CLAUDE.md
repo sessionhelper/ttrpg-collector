@@ -52,6 +52,13 @@ uv run pytest
 uv run ruff check src/ tests/
 ```
 
+## Git Workflow
+
+- **main** — production branch, deploys to VPS on push. Never commit directly.
+- **dev** — integration branch. Feature branches merge here first.
+- **feature/*** — short-lived branches for individual features. Branch from dev, merge back into dev via PR or `--no-ff` merge.
+- When dev is stable, merge dev into main to trigger deploy.
+
 ## Deploying
 
 Push to `main` → GitHub Actions runs tests → builds Docker image → pushes to GHCR → SSHs to VPS and restarts.
