@@ -1,0 +1,7 @@
+services:
+  collector:
+    image: ghcr.io/${GITHUB_REPO:-ttrpg-collector}:latest
+    restart: always
+    env_file: .env
+    volumes:
+      - ./sessions:/app/sessions
