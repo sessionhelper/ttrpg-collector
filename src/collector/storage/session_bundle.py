@@ -58,12 +58,12 @@ class SessionBundle:
         for uid, p in consent_session.participants.items():
             pseudo_id = pseudo_map[uid]
             stream_state = stream_manager.get_user(uid)
-            wav_file = f"audio/{uid}.wav"
-            has_wav = any(w.name == f"{uid}.wav" for w in wav_paths)
+            track_file = f"audio/{uid}.flac"
+            has_track = any(w.name == f"{uid}.flac" for w in wav_paths)
 
             entry = {
                 "pseudo_id": pseudo_id,
-                "track_file": wav_file if has_wav else None,
+                "track_file": track_file if has_track else None,
                 "consent_scope": p.scope.value if p.scope else None,
                 "gaps": stream_state.gaps if stream_state else [],
             }
@@ -84,8 +84,8 @@ class SessionBundle:
                 "sample_rate": 48000,
                 "bit_depth": 16,
                 "channels": 1,
-                "codec": "pcm_s16le",
-                "container": "wav",
+                "codec": "flac",
+                "container": "flac",
             },
             "participants": participants,
             "quality_flags": quality_flags or {},
@@ -138,14 +138,14 @@ class SessionBundle:
         log.info("notes_written", path=str(notes_path))
         return notes_path
 
-    def rename_wav_files(self, wav_paths: list[Path]) -> list[Path]:
-        """Rename WAV files from user_id.wav to pseudo_id.wav for the public dataset."""
+    def rename_audio_files(self, audio_paths: list[Path]) -> list[Path]:
+        """Rename audio files from user_id to pseudo_id for the public dataset."""
         renamed = []
-        for wav in wav_paths:
-            user_id = int(wav.stem)
+        for path in audio_paths:
+            user_id = int(path.stem)
             pseudo_id = self.pseudonymize(user_id)
-            new_path = wav.parent / f"{pseudo_id}.wav"
-            wav.rename(new_path)
+            new_path = path.parent / f"{pseudo_id}{path.suffix}"
+            path.rename(new_path)
             renamed.append(new_path)
-            log.info("wav_renamed", old=wav.name, new=new_path.name)
+            log.info("track_renamed", old=path.name, new=new_path.name)
         return renamed

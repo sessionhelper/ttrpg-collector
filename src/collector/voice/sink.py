@@ -97,29 +97,29 @@ class DiskSink(discord.sinks.Sink):
         for stream in self._streams.values():
             stream.close()
 
-    async def convert_to_wav(self) -> list[Path]:
-        """Convert all PCM files to WAV. Returns list of WAV paths."""
+    async def convert_to_flac(self) -> list[Path]:
+        """Convert all PCM files to FLAC. Returns list of FLAC paths."""
         self.cleanup()
-        wav_paths = []
+        flac_paths = []
         loop = asyncio.get_event_loop()
 
         for stream in self._streams.values():
             if stream.bytes_written == 0:
                 continue
-            wav_path = self.audio_dir / f"{stream.user_id}.wav"
-            await loop.run_in_executor(None, self._pcm_to_wav, stream.pcm_path, wav_path)
-            wav_paths.append(wav_path)
+            flac_path = self.audio_dir / f"{stream.user_id}.flac"
+            await loop.run_in_executor(None, self._pcm_to_flac, stream.pcm_path, flac_path)
+            flac_paths.append(flac_path)
             log.info(
-                "wav_converted",
+                "flac_converted",
                 user_id=stream.user_id,
                 pcm_bytes=stream.bytes_written,
-                wav_path=str(wav_path),
+                flac_path=str(flac_path),
             )
-        return wav_paths
+        return flac_paths
 
     @staticmethod
-    def _pcm_to_wav(pcm_path: Path, wav_path: Path) -> None:
-        """Convert raw PCM to WAV using ffmpeg."""
+    def _pcm_to_flac(pcm_path: Path, flac_path: Path) -> None:
+        """Convert raw PCM to FLAC using ffmpeg."""
         cmd = [
             "ffmpeg",
             "-y",
@@ -135,7 +135,7 @@ class DiskSink(discord.sinks.Sink):
             "1",  # downmix to mono
             "-ar",
             "48000",
-            str(wav_path),
+            str(flac_path),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
