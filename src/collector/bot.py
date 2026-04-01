@@ -12,6 +12,10 @@ from collector.utils.logging import setup_logging
 
 log = structlog.get_logger()
 
+# Load opus for voice receive
+if not discord.opus.is_loaded():
+    discord.opus.load_opus("libopus.so.0")
+
 
 def create_bot() -> commands.Bot:
     intents = discord.Intents.default()
