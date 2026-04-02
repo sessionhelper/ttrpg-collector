@@ -82,20 +82,12 @@ class DiskSink(discord.sinks.Sink):
     def write(self, data, user) -> None:
         """Called by py-cord for each chunk of decoded PCM audio.
 
-        In the DAVE branch, data is a VoiceData object with .pcm bytes,
-        and user is a Member/User object (not an int).
+        Hot path — no logging, no allocations beyond the write itself.
         """
-        # Handle both old API (bytes, int) and new DAVE API (VoiceData, Member)
         pcm = data.pcm if hasattr(data, "pcm") else data
         user_id = user.id if hasattr(user, "id") else user
 
-        # Skip empty PCM but count them
         if not pcm:
-            if not hasattr(self, "_empty_count"):
-                self._empty_count = 0
-            self._empty_count += 1
-            if self._empty_count % 50 == 1:
-                log.warning("empty_pcm_skipped", count=self._empty_count)
             return
 
         stream = self._get_or_create_stream(user_id)
@@ -108,19 +100,8 @@ class DiskSink(discord.sinks.Sink):
             if stream._last_seq >= 0:
                 gap = (seq - stream._last_seq - 1) & 0xFFFF
                 if 0 < gap < 100:
-                    if gap > 2:
-                        log.warning(
-                            "gap_detected",
-                            seq=seq,
-                            last_seq=stream._last_seq,
-                            gap=gap,
-                        )
                     stream.write(self.SILENCE_FRAME * gap)
             stream._last_seq = seq
-
-        # Log PCM frame size anomalies
-        if len(pcm) != self.FRAME_SIZE:
-            log.warning("unexpected_pcm_size", expected=self.FRAME_SIZE, actual=len(pcm))
 
         stream.write(pcm)
 
