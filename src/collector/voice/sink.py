@@ -89,8 +89,13 @@ class DiskSink(discord.sinks.Sink):
         pcm = data.pcm if hasattr(data, "pcm") else data
         user_id = user.id if hasattr(user, "id") else user
 
-        # Skip empty PCM
+        # Skip empty PCM but count them
         if not pcm:
+            if not hasattr(self, "_empty_count"):
+                self._empty_count = 0
+            self._empty_count += 1
+            if self._empty_count % 50 == 1:
+                log.warning("empty_pcm_skipped", count=self._empty_count)
             return
 
         stream = self._get_or_create_stream(user_id)
