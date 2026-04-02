@@ -46,7 +46,9 @@ class VoiceRecorder:
             if m.id in self.sink.consented_user_ids:
                 self.stream_manager.track_user(m.id, m.display_name)
 
-        self.voice_client.start_recording(self.sink, self._on_recording_stopped)
+        # A/B test: use py-cord's WaveSink to compare with our DiskSink
+        self._test_sink = discord.sinks.WaveSink()
+        self.voice_client.start_recording(self._test_sink, self._on_recording_stopped)
         self._recording = True
         log.info("recording_started", user_count=len(self.sink.consented_user_ids))
 
@@ -74,6 +76,15 @@ class VoiceRecorder:
         if self.voice_client and self._recording:
             self.voice_client.stop_recording()
             self._recording = False
+
+        # Dump WaveSink comparison data
+        if hasattr(self, "_test_sink") and self._test_sink.audio_data:
+            for user_id, audio in self._test_sink.audio_data.items():
+                audio.file.seek(0)
+                raw = audio.file.read()
+                wav_path = self.session_dir / f"builtin_{user_id}.raw"
+                wav_path.write_bytes(raw)
+                log.info("builtin_sink_captured", user=str(user_id), bytes=len(raw))
 
         audio_paths = await self.sink.convert_to_flac()
         log.info("recording_finalized", track_count=len(audio_paths))
