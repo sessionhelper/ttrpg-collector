@@ -90,6 +90,7 @@ pub async fn handle_stop(
         bundle.ended_at = Some(chrono::Utc::now());
 
         // Rename PCM files from SSRC to pseudo user ID
+        let mut renamed = false;
         let ssrc_map = state.ssrc_maps.lock().await;
         if let Some(map) = ssrc_map.get(&guild_id.get()) {
             let map = map.lock().await;
@@ -100,7 +101,31 @@ pub async fn handle_stop(
                 if src.exists() {
                     let _ = std::fs::rename(&src, &dst);
                     info!(ssrc = ssrc, pseudo = %pseudo, "track_renamed");
+                    renamed = true;
                 }
+            }
+        }
+
+        // Fallback: match PCM files to consented users by order
+        if !renamed {
+            let consented = consent.consented_user_ids();
+            let mut pcm_files: Vec<_> = std::fs::read_dir(bundle.pcm_dir())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "pcm"))
+                .collect();
+            pcm_files.sort_by_key(|e| e.file_name());
+
+            for (file, uid) in pcm_files.iter().zip(consented.iter()) {
+                let pseudo = pseudonymize(uid.get());
+                let dst = bundle.pcm_dir().join(format!("{}.pcm", pseudo));
+                let _ = std::fs::rename(file.path(), &dst);
+                info!(
+                    from = %file.file_name().to_string_lossy(),
+                    pseudo = %pseudo,
+                    "track_renamed_fallback"
+                );
             }
         }
 
