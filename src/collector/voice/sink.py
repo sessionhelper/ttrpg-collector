@@ -89,21 +89,24 @@ class DiskSink(discord.sinks.Sink):
         pcm = data.pcm if hasattr(data, "pcm") else data
         user_id = user.id if hasattr(user, "id") else user
 
-        # Track sequence numbers and fill gaps with silence
-        if hasattr(data, "packet"):
+        # Skip empty PCM
+        if not pcm:
+            return
+
+        stream = self._get_or_create_stream(user_id)
+        if stream is None:
+            return
+
+        # Fill gaps with silence using sequence numbers
+        if hasattr(data, "packet") and hasattr(data.packet, "sequence"):
             seq = data.packet.sequence
-            stream = self._get_or_create_stream(user_id)
-            if stream is not None:
-                if hasattr(stream, "_last_seq") and stream._last_seq >= 0:
-                    gap = (seq - stream._last_seq - 1) & 0xFFFF
-                    if 0 < gap < 100:  # reasonable gap, not a wrap-around glitch
-                        stream.write(self.SILENCE_FRAME * gap)
-                stream._last_seq = seq
-                stream.write(pcm)
-        else:
-            stream = self._get_or_create_stream(user_id)
-            if stream is not None:
-                stream.write(pcm)
+            if stream._last_seq >= 0:
+                gap = (seq - stream._last_seq - 1) & 0xFFFF
+                if 0 < gap < 100:
+                    stream.write(self.SILENCE_FRAME * gap)
+            stream._last_seq = seq
+
+        stream.write(pcm)
 
     def add_consented_user(self, user_id: int) -> None:
         """Allow a mid-session joiner to be recorded."""
