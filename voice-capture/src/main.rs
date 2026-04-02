@@ -205,10 +205,7 @@ async fn handle_consent_button(
 
                 component
                     .channel_id
-                    .say(
-                        &ctx.http,
-                        "Recording started. Use `/stop` to end the recording.",
-                    )
+                    .say(&ctx.http, "Recording. Use `/stop` when done.")
                     .await?;
             }
             Err(e) => {

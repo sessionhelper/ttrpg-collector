@@ -53,9 +53,7 @@ pub async fn handle_stop(
     command
         .create_response(
             &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content("Stopping recording..."),
-            ),
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
         )
         .await?;
 
@@ -175,11 +173,6 @@ pub async fn handle_stop(
     };
 
     // Upload to S3
-    command
-        .channel_id
-        .say(&ctx.http, "Uploading to storage...")
-        .await?;
-
     match state
         .s3
         .upload_session(&session_dir, guild_id_u64, &session_id)
@@ -187,22 +180,16 @@ pub async fn handle_stop(
     {
         Ok(count) => {
             info!(count = count, session_id = %session_id, "upload_complete");
-            command
-                .channel_id
-                .say(
-                    &ctx.http,
-                    format!("Recording complete. {} files uploaded.", count),
-                )
-                .await?;
         }
         Err(e) => {
             error!(error = %e, "upload_failed");
-            command
-                .channel_id
-                .say(&ctx.http, "Recording saved locally. Upload failed.")
-                .await?;
         }
     }
+
+    command
+        .channel_id
+        .say(&ctx.http, "Recording saved. Thanks for contributing!")
+        .await?;
 
     // Cleanup state
     {

@@ -149,10 +149,7 @@ pub async fn handle_record(
             &ctx.http,
             CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(format!(
-                        "Recording requested by <@{}>. {}\nPlease respond below:",
-                        command.user.id, mentions
-                    ))
+                    .content(mentions)
                     .embed(embed)
                     .components(vec![buttons]),
             ),
