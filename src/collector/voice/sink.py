@@ -108,8 +108,19 @@ class DiskSink(discord.sinks.Sink):
             if stream._last_seq >= 0:
                 gap = (seq - stream._last_seq - 1) & 0xFFFF
                 if 0 < gap < 100:
+                    if gap > 2:
+                        log.warning(
+                            "gap_detected",
+                            seq=seq,
+                            last_seq=stream._last_seq,
+                            gap=gap,
+                        )
                     stream.write(self.SILENCE_FRAME * gap)
             stream._last_seq = seq
+
+        # Log PCM frame size anomalies
+        if len(pcm) != self.FRAME_SIZE:
+            log.warning("unexpected_pcm_size", expected=self.FRAME_SIZE, actual=len(pcm))
 
         stream.write(pcm)
 
