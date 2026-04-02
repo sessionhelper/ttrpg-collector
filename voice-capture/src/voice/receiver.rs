@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,14 +18,20 @@ pub struct AudioReceiver {
     output_dir: PathBuf,
     writers: Arc<Mutex<HashMap<u32, SpeakerWriter>>>,
     ssrc_to_user: Arc<Mutex<HashMap<u32, u64>>>,
+    consented_users: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl AudioReceiver {
-    fn new(output_dir: PathBuf, ssrc_map: Arc<Mutex<HashMap<u32, u64>>>) -> Self {
+    fn new(
+        output_dir: PathBuf,
+        ssrc_map: Arc<Mutex<HashMap<u32, u64>>>,
+        consented_users: Arc<Mutex<HashSet<u64>>>,
+    ) -> Self {
         Self {
             output_dir,
             writers: Arc::new(Mutex::new(HashMap::new())),
             ssrc_to_user: ssrc_map,
+            consented_users,
         }
     }
 
@@ -34,10 +40,11 @@ impl AudioReceiver {
     pub fn register(
         call: &mut songbird::Call,
         output_dir: PathBuf,
+        consented_users: Arc<Mutex<HashSet<u64>>>,
     ) -> Arc<Mutex<HashMap<u32, u64>>> {
         let ssrc_map = Arc::new(Mutex::new(HashMap::new()));
 
-        let receiver = Self::new(output_dir, ssrc_map.clone());
+        let receiver = Self::new(output_dir, ssrc_map.clone(), consented_users);
         call.add_global_event(CoreEvent::VoiceTick.into(), receiver);
 
         let tracker = SpeakingTracker {
@@ -57,8 +64,20 @@ impl VoiceEventHandler for AudioReceiver {
         }) = ctx
         {
             let mut writers = self.writers.lock().await;
+            let ssrc_map = self.ssrc_to_user.lock().await;
+            let consented = self.consented_users.lock().await;
 
             for (ssrc, data) in speaking {
+                // Only write audio for consented users
+                if let Some(user_id) = ssrc_map.get(ssrc) {
+                    if !consented.contains(user_id) {
+                        continue;
+                    }
+                } else {
+                    // SSRC not yet mapped to a user — skip until we know who it is
+                    continue;
+                }
+
                 if let Some(decoded) = &data.decoded_voice {
                     let writer = writers.entry(*ssrc).or_insert_with(|| {
                         let path = self.output_dir.join(format!("{}.pcm", ssrc));

@@ -5,6 +5,7 @@ mod state;
 mod storage;
 mod voice;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -13,7 +14,7 @@ use serenity::async_trait;
 use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::serenity::register_from_config;
 use songbird::Config as SongbirdConfig;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::consent::*;
@@ -90,21 +91,93 @@ impl EventHandler for Handler {
     }
 
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, _new: VoiceState) {
-        // Check if bot is alone in any recording channel
         let guild_id = match _new.guild_id {
             Some(id) => id,
             None => return,
         };
 
-        let channel_id = {
+        let (channel_id, text_channel_id, is_recording) = {
             let consent = self.state.consent.lock().await;
             match consent.get_session(guild_id.get()) {
-                Some(s) if s.state == SessionState::Recording => ChannelId::new(s.channel_id),
+                Some(s) if s.state == SessionState::Recording => {
+                    (ChannelId::new(s.channel_id), ChannelId::new(s.text_channel_id), true)
+                }
                 _ => return,
             }
         };
 
-        // Count non-bot members in the channel
+        if !is_recording {
+            return;
+        }
+
+        // Check if this is a new user joining the recording channel
+        let joined_recording_channel = _new.channel_id == Some(channel_id);
+        let was_in_channel = _old.as_ref().is_some_and(|o| o.channel_id == Some(channel_id));
+
+        if joined_recording_channel && !was_in_channel {
+            let user_id = _new.user_id;
+
+            // Skip bots
+            let guild = match ctx.cache.guild(guild_id) {
+                Some(g) => g.clone(),
+                None => return,
+            };
+            if guild.members.get(&user_id).is_some_and(|m| m.user.bot) {
+                return;
+            }
+
+            // Check if already a participant
+            let already_participant = {
+                let consent = self.state.consent.lock().await;
+                if let Some(session) = consent.get_session(guild_id.get()) {
+                    session.participants.contains_key(&user_id)
+                } else {
+                    return;
+                }
+            };
+
+            if !already_participant {
+                let display_name = guild
+                    .members
+                    .get(&user_id)
+                    .map(|m| m.display_name().to_string())
+                    .unwrap_or_else(|| format!("User {}", user_id));
+
+                // Add as mid-session joiner
+                {
+                    let mut consent = self.state.consent.lock().await;
+                    if let Some(session) = consent.get_session_mut(guild_id.get()) {
+                        session.add_participant(user_id, display_name.clone(), true);
+                    }
+                }
+
+                info!(user_id = %user_id, name = %display_name, "mid_session_joiner");
+
+                // Send consent prompt in text channel
+                let embed = {
+                    let consent = self.state.consent.lock().await;
+                    if let Some(session) = consent.get_session(guild_id.get()) {
+                        build_consent_embed(session)
+                    } else {
+                        return;
+                    }
+                };
+
+                let msg = CreateMessage::new()
+                    .content(format!(
+                        "<@{}> joined the voice channel during recording. Their audio is **not being captured** until they consent.",
+                        user_id
+                    ))
+                    .embed(embed)
+                    .components(vec![consent_buttons()]);
+
+                if let Err(e) = text_channel_id.send_message(&ctx.http, msg).await {
+                    warn!(error = %e, "failed to send mid-session consent prompt");
+                }
+            }
+        }
+
+        // Auto-stop: check if bot is alone
         let guild = match ctx.cache.guild(guild_id) {
             Some(g) => g.clone(),
             None => return,
@@ -151,7 +224,6 @@ impl EventHandler for Handler {
                     let manager = songbird::get(&ctx_clone).await.unwrap();
                     let _ = manager.leave(guild_id).await;
 
-                    // Finalize
                     commands::stop::auto_stop(&ctx_clone, guild_id.get(), &state).await;
                 }
             });
@@ -173,7 +245,7 @@ async fn handle_consent_button(
         _ => return Ok(()),
     };
 
-    let (should_start, embed, session_id, channel_id) = {
+    let (should_start, is_mid_session_accept, embed, session_id, channel_id) = {
         let mut manager = state.consent.lock().await;
         let session = match manager.get_session_mut(guild_id) {
             Some(s) => s,
@@ -208,16 +280,32 @@ async fn handle_consent_button(
             return Ok(());
         }
 
+        let is_mid_session = session.state == SessionState::Recording
+            && session.participants[&user_id].mid_session_join;
+
         session.record_consent(user_id, scope);
         info!(user_id = %user_id, scope = ?scope, "consent_recorded");
 
         let embed = build_consent_embed(session);
-        let should_start = session.all_responded() && session.evaluate_quorum();
+        let should_start = session.state == SessionState::AwaitingConsent
+            && session.all_responded()
+            && session.evaluate_quorum();
+        let is_mid_session_accept = is_mid_session && scope == ConsentScope::Full;
         let session_id = session.session_id.clone();
         let channel_id = ChannelId::new(session.channel_id);
 
-        (should_start, embed, session_id, channel_id)
+        (should_start, is_mid_session_accept, embed, session_id, channel_id)
     };
+
+    // Mid-session joiner accepted — add to consented_users so their audio is captured
+    if is_mid_session_accept {
+        let cu = state.consented_users.lock().await;
+        if let Some(set) = cu.get(&guild_id) {
+            let mut set = set.lock().await;
+            set.insert(user_id.get());
+            info!(user_id = %user_id, "mid_session_consent_granted — audio capture enabled");
+        }
+    }
 
     // Update the embed
     component
@@ -252,10 +340,27 @@ async fn handle_consent_button(
                     }
                 };
 
+                // Build consented users set
+                let consented_set = {
+                    let consent_mgr = state.consent.lock().await;
+                    let session = consent_mgr.get_session(guild_id).unwrap();
+                    let set: HashSet<u64> = session
+                        .consented_user_ids()
+                        .into_iter()
+                        .map(|uid| uid.get())
+                        .collect();
+                    Arc::new(tokio::sync::Mutex::new(set))
+                };
+
+                {
+                    let mut cu = state.consented_users.lock().await;
+                    cu.insert(guild_id, consented_set.clone());
+                }
+
                 info!(output_dir = %output_dir.display(), "registering_audio_receiver");
 
                 let mut handler = call.lock().await;
-                let ssrc_map = AudioReceiver::register(&mut handler, output_dir);
+                let ssrc_map = AudioReceiver::register(&mut handler, output_dir, consented_set);
 
                 {
                     let mut maps = state.ssrc_maps.lock().await;
