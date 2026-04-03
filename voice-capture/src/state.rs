@@ -14,8 +14,10 @@ pub struct AppState {
     pub bundles: Arc<Mutex<HashMap<u64, SessionBundle>>>,
     pub ssrc_maps: Arc<Mutex<HashMap<u64, Arc<Mutex<HashMap<u32, u64>>>>>>,
     pub consented_users: Arc<Mutex<HashMap<u64, Arc<Mutex<HashSet<u64>>>>>>,
-    pub s3: S3Uploader,
+    pub s3: Arc<S3Uploader>,
     pub db: sqlx::PgPool,
+    /// Per-guild audio handles for clean shutdown on /stop.
+    pub audio_handles: Arc<Mutex<HashMap<u64, crate::voice::AudioHandle>>>,
     /// Cleanup tasks for ephemeral license button messages (per guild).
     /// Aborted on session end so stale messages get cleaned up immediately.
     pub license_cleanup_tasks: Arc<Mutex<HashMap<u64, Vec<JoinHandle<()>>>>>,
@@ -23,7 +25,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config, db: sqlx::PgPool) -> Self {
-        let s3 = S3Uploader::new(&config);
+        let s3 = Arc::new(S3Uploader::new(&config));
         Self {
             config,
             consent: Arc::new(Mutex::new(ConsentManager::new())),
@@ -33,6 +35,7 @@ impl AppState {
             s3,
             db,
             license_cleanup_tasks: Arc::new(Mutex::new(HashMap::new())),
+            audio_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

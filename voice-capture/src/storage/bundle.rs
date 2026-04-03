@@ -100,7 +100,8 @@ impl SessionBundle {
         self.session_dir.join("audio")
     }
 
-    pub fn write_meta(&self, consent: &ConsentSession) -> PathBuf {
+    /// Serialize session metadata to JSON bytes (for S3 upload).
+    pub fn meta_json(&self, consent: &ConsentSession) -> Vec<u8> {
         let duration = self
             .ended_at
             .map(|e| (e - self.started_at).num_milliseconds() as f64 / 1000.0)
@@ -113,8 +114,9 @@ impl SessionBundle {
                 let pseudo = pseudonymize(p.user_id.get());
                 ParticipantMeta {
                     pseudo_id: pseudo.clone(),
+                    // Audio is stored as chunked PCM under audio/{pseudo_id}/
                     track_file: if p.scope == Some(ConsentScope::Full) {
-                        Some(format!("audio/{}.flac", pseudo))
+                        Some(format!("audio/{}/", pseudo))
                     } else {
                         None
                     },
@@ -138,19 +140,19 @@ impl SessionBundle {
                 sample_rate: 48000,
                 bit_depth: 16,
                 channels: 2,
-                codec: "flac".to_string(),
-                container: "flac".to_string(),
+                codec: "pcm_s16le".to_string(),
+                container: "raw".to_string(),
             },
             participants,
         };
 
-        let path = self.session_dir.join("meta.json");
-        let json = serde_json::to_string_pretty(&meta).expect("Failed to serialize meta");
-        std::fs::write(&path, json).expect("Failed to write meta.json");
-        path
+        serde_json::to_string_pretty(&meta)
+            .expect("Failed to serialize meta")
+            .into_bytes()
     }
 
-    pub fn write_consent(&self, consent: &ConsentSession) -> PathBuf {
+    /// Serialize consent records to JSON bytes (for S3 upload).
+    pub fn consent_json(&self, consent: &ConsentSession) -> Vec<u8> {
         let mut participants = HashMap::new();
         for p in consent.participants.values() {
             let pseudo = pseudonymize(p.user_id.get());
@@ -172,9 +174,8 @@ impl SessionBundle {
             participants,
         };
 
-        let path = self.session_dir.join("consent.json");
-        let json = serde_json::to_string_pretty(&record).expect("Failed to serialize consent");
-        std::fs::write(&path, json).expect("Failed to write consent.json");
-        path
+        serde_json::to_string_pretty(&record)
+            .expect("Failed to serialize consent")
+            .into_bytes()
     }
 }
