@@ -1,5 +1,3 @@
-pub mod manager;
-pub mod embeds;
-
-pub use manager::{ConsentManager, ConsentScope, ConsentSession, SessionState};
-pub use embeds::build_consent_embed;
+// Consent management has moved to crate::session.
+// This module is kept empty to avoid breaking the directory structure during transition.
+// TODO: Remove this module entirely once all references are cleaned up.

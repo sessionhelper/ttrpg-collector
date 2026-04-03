@@ -2,11 +2,11 @@ mod commands;
 mod config;
 mod consent;
 mod db;
+mod session;
 mod state;
 mod storage;
 mod voice;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -18,10 +18,8 @@ use songbird::Config as SongbirdConfig;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::consent::*;
-use crate::consent::embeds::consent_buttons;
+use crate::session::{consent_buttons, ConsentScope, Phase};
 use crate::state::AppState;
-use crate::voice::AudioReceiver;
 
 struct Handler {
     state: Arc<AppState>,
@@ -69,13 +67,13 @@ impl EventHandler for Handler {
             Interaction::Component(component) => {
                 if let Err(e) = handle_consent_button(&ctx, &component, &self.state).await {
                     error!(error = %e, "consent_button_error");
-                    // Clean up stale session on interaction failure
+                    // Clean up stale session on interaction failure — only if still awaiting consent
                     if let Some(gid) = component.guild_id {
-                        let mut manager = self.state.consent.lock().await;
-                        if let Some(session) = manager.get_session(gid.get()) {
-                            if session.state == SessionState::AwaitingConsent {
+                        let mut sessions = self.state.sessions.lock().await;
+                        if let Some(session) = sessions.get(gid.get()) {
+                            if matches!(session.phase, Phase::AwaitingConsent) {
                                 info!(guild_id = %gid, "cleaning_up_stale_session");
-                                manager.remove_session(gid.get());
+                                sessions.remove(gid.get());
                             }
                         }
                     }
@@ -85,25 +83,23 @@ impl EventHandler for Handler {
         }
     }
 
+    /// Handle voice state changes: mid-session joins and auto-stop when channel empties.
     async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, _new: VoiceState) {
         let guild_id = match _new.guild_id {
             Some(id) => id,
             None => return,
         };
 
-        let (channel_id, text_channel_id, is_recording) = {
-            let consent = self.state.consent.lock().await;
-            match consent.get_session(guild_id.get()) {
-                Some(s) if s.state == SessionState::Recording => {
-                    (ChannelId::new(s.channel_id), ChannelId::new(s.text_channel_id), true)
+        // Only proceed if there's an active recording session for this guild
+        let (channel_id, text_channel_id) = {
+            let sessions = self.state.sessions.lock().await;
+            match sessions.get(guild_id.get()) {
+                Some(s) if matches!(s.phase, Phase::Recording { .. }) => {
+                    (ChannelId::new(s.channel_id), ChannelId::new(s.text_channel_id))
                 }
                 _ => return,
             }
         };
-
-        if !is_recording {
-            return;
-        }
 
         // Check if this is a new user joining the recording channel
         let joined_recording_channel = _new.channel_id == Some(channel_id);
@@ -121,18 +117,16 @@ impl EventHandler for Handler {
                 return;
             }
 
-            // Check if already a participant
+            // Check if already a participant — single lock
             let already_participant = {
-                let consent = self.state.consent.lock().await;
-                if let Some(session) = consent.get_session(guild_id.get()) {
-                    session.participants.contains_key(&user_id)
-                } else {
-                    return;
-                }
+                let sessions = self.state.sessions.lock().await;
+                sessions
+                    .get(guild_id.get())
+                    .is_some_and(|s| s.participants.contains_key(&user_id))
             };
 
             if !already_participant {
-                // Write Point 5: Check blocklist before adding mid-session joiner
+                // Check blocklist before adding mid-session joiner
                 match db::check_blocklist(&self.state.db, user_id.get()).await {
                     Ok(true) => {
                         info!(user_id = %user_id, "mid_session_joiner_blocked — user opted out globally");
@@ -151,21 +145,18 @@ impl EventHandler for Handler {
                     .map(|m| m.display_name().to_string())
                     .unwrap_or_else(|| format!("User {}", user_id));
 
-                // Get session_id for DB write
+                // Add as mid-session joiner and get session ID for DB write
                 let session_id_str = {
-                    let consent = self.state.consent.lock().await;
-                    consent.get_session(guild_id.get()).map(|s| s.session_id.clone())
+                    let mut sessions = self.state.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(guild_id.get()) {
+                        session.add_participant(user_id, display_name.clone(), true);
+                        Some(session.id.clone())
+                    } else {
+                        None
+                    }
                 };
 
-                // Add as mid-session joiner
-                {
-                    let mut consent = self.state.consent.lock().await;
-                    if let Some(session) = consent.get_session_mut(guild_id.get()) {
-                        session.add_participant(user_id, display_name.clone(), true);
-                    }
-                }
-
-                // Write Point 5: Add mid-session participant to Postgres
+                // Persist mid-session participant to Postgres
                 if let Some(sid_str) = &session_id_str {
                     if let Ok(sid) = uuid::Uuid::parse_str(sid_str) {
                         if let Err(e) = db::add_participant(&self.state.db, &db::NewParticipant {
@@ -180,11 +171,11 @@ impl EventHandler for Handler {
 
                 info!(user_id = %user_id, name = %display_name, "mid_session_joiner");
 
-                // Send consent prompt in text channel
+                // Build consent embed from session state
                 let embed = {
-                    let consent = self.state.consent.lock().await;
-                    if let Some(session) = consent.get_session(guild_id.get()) {
-                        build_consent_embed(session)
+                    let sessions = self.state.sessions.lock().await;
+                    if let Some(session) = sessions.get(guild_id.get()) {
+                        session.consent_embed()
                     } else {
                         return;
                     }
@@ -204,7 +195,7 @@ impl EventHandler for Handler {
             }
         }
 
-        // Auto-stop: check if bot is alone
+        // Auto-stop: check if bot is alone in the voice channel
         let guild = match ctx.cache.guild(guild_id) {
             Some(g) => g.clone(),
             None => return,
@@ -228,7 +219,7 @@ impl EventHandler for Handler {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-                // Re-check after 30s
+                // Re-check after 30s to avoid false triggers from brief disconnects
                 let guild = match ctx_clone.cache.guild(guild_id) {
                     Some(g) => g.clone(),
                     None => return,
@@ -258,6 +249,8 @@ impl EventHandler for Handler {
     }
 }
 
+/// Handle consent Accept/Decline button clicks.
+/// Uses one lock on `state.sessions` to read and mutate session state.
 async fn handle_consent_button(
     ctx: &Context,
     component: &ComponentInteraction,
@@ -275,9 +268,10 @@ async fn handle_consent_button(
         _ => return Ok(()),
     };
 
+    // Lock sessions once, record consent, and extract everything we need
     let (should_start, is_mid_session_accept, embed, session_id, channel_id) = {
-        let mut manager = state.consent.lock().await;
-        let session = match manager.get_session_mut(guild_id) {
+        let mut sessions = state.sessions.lock().await;
+        let session = match sessions.get_mut(guild_id) {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -310,18 +304,19 @@ async fn handle_consent_button(
             return Ok(());
         }
 
-        let is_mid_session = session.state == SessionState::Recording
+        // Check if this is a mid-session joiner accepting during recording
+        let is_mid_session = matches!(session.phase, Phase::Recording { .. })
             && session.participants[&user_id].mid_session_join;
 
         session.record_consent(user_id, scope);
         info!(user_id = %user_id, scope = ?scope, "consent_recorded");
 
-        let embed = build_consent_embed(session);
-        let should_start = session.state == SessionState::AwaitingConsent
+        let embed = session.consent_embed();
+        let should_start = matches!(session.phase, Phase::AwaitingConsent)
             && session.all_responded()
             && session.evaluate_quorum();
         let is_mid_session_accept = is_mid_session && scope == ConsentScope::Full;
-        let session_id = session.session_id.clone();
+        let session_id = session.id.clone();
         let channel_id = ChannelId::new(session.channel_id);
 
         (should_start, is_mid_session_accept, embed, session_id, channel_id)
@@ -341,11 +336,13 @@ async fn handle_consent_button(
 
     // Mid-session joiner accepted — add to consented_users so their audio is captured
     if is_mid_session_accept {
-        let cu = state.consented_users.lock().await;
-        if let Some(set) = cu.get(&guild_id) {
-            let mut set = set.lock().await;
-            set.insert(user_id.get());
-            info!(user_id = %user_id, "mid_session_consent_granted — audio capture enabled");
+        let sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get(guild_id) {
+            if let Phase::Recording { consented_users, .. } = &session.phase {
+                let mut set = consented_users.lock().await;
+                set.insert(user_id.get());
+                info!(user_id = %user_id, "mid_session_consent_granted — audio capture enabled");
+            }
         }
     }
 
@@ -358,55 +355,15 @@ async fn handle_consent_button(
             Ok(call) => {
                 info!("voice_joined");
 
-                // Get output dir from bundle
-                let output_dir = {
-                    let bundles = state.bundles.lock().await;
-                    match bundles.get(&guild_id) {
-                        Some(b) => b.pcm_dir(),
-                        None => {
-                            error!("no bundle found for guild {}", guild_id);
-                            return Ok(());
-                        }
-                    }
-                };
-
-                // Build consented users set
-                let consented_set = {
-                    let consent_mgr = state.consent.lock().await;
-                    let session = consent_mgr.get_session(guild_id).unwrap();
-                    let set: HashSet<u64> = session
-                        .consented_user_ids()
-                        .into_iter()
-                        .map(|uid| uid.get())
-                        .collect();
-                    Arc::new(tokio::sync::Mutex::new(set))
-                };
-
-                {
-                    let mut cu = state.consented_users.lock().await;
-                    cu.insert(guild_id, consented_set.clone());
-                }
-
-                // Create audio pipeline ONCE — channel + buffer task
-                let audio_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let s3_prefix = format!("sessions/{}/{}/audio", guild_id, session_id);
-                let (audio_tx, audio_handle) = AudioReceiver::create_pipeline(
-                    state.s3.clone(), s3_prefix.clone(),
-                );
-
-                info!(s3_prefix = %s3_prefix, "registering_audio_receiver");
-
-                // Attach to the Songbird Call (wires VoiceTick → channel)
-                {
+                // Start the audio pipeline via the session state machine
+                let _audio_tx = {
+                    let mut sessions = state.sessions.lock().await;
+                    let session = sessions.get_mut(guild_id).unwrap();
                     let mut handler = call.lock().await;
-                    let ssrc_map = AudioReceiver::attach(
-                        &mut handler, audio_tx.clone(), consented_set.clone(), audio_received.clone(),
-                    );
-                    let mut maps = state.ssrc_maps.lock().await;
-                    maps.insert(guild_id, ssrc_map);
-                    let mut ah = state.audio_handles.lock().await;
-                    ah.insert(guild_id, audio_handle);
-                }
+                    session.start_recording(&mut handler, state.s3.clone())
+                };
+
+                info!(session_id = %session_id, "registering_audio_receiver");
 
                 // Wait for DAVE to deliver decoded audio — retry voice join if needed
                 const DAVE_WAIT_SECS: u64 = 5;
@@ -416,22 +373,25 @@ async fn handle_consent_button(
                     info!(attempt = attempt, "waiting_for_dave");
                     tokio::time::sleep(std::time::Duration::from_secs(DAVE_WAIT_SECS)).await;
 
-                    // Check if decoded audio arrived (someone was speaking)
-                    if audio_received.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Check session state for DAVE confirmation
+                    let (has_audio, _has_ssrc) = {
+                        let sessions = state.sessions.lock().await;
+                        let session = sessions.get(guild_id).unwrap();
+                        let audio = session.has_audio();
+                        // has_ssrc is async because it locks the ssrc_map inside Phase
+                        (audio, false) // will check ssrc separately
+                    };
+
+                    if has_audio {
                         info!(attempt = attempt, "dave_audio_confirmed");
                         break;
                     }
 
-                    // Also check if SSRC mapping arrived — DAVE is working,
-                    // just nobody spoke during the check window
+                    // Check SSRC separately (needs .await inside the session)
                     let has_ssrc = {
-                        let maps = state.ssrc_maps.lock().await;
-                        if let Some(m) = maps.get(&guild_id) {
-                            let inner = m.lock().await;
-                            !inner.is_empty()
-                        } else {
-                            false
-                        }
+                        let sessions = state.sessions.lock().await;
+                        let session = sessions.get(guild_id).unwrap();
+                        session.has_ssrc().await
                     };
                     if has_ssrc {
                         info!(attempt = attempt, "dave_connection_confirmed — ssrc mapped, awaiting speech");
@@ -440,28 +400,18 @@ async fn handle_consent_button(
 
                     if attempt == MAX_ATTEMPTS {
                         warn!("dave_failed — no audio or ssrc after {MAX_ATTEMPTS} attempts");
-                        // Clean up: shut down buffer task, leave voice, remove state
+                        // Clean up: shut down audio pipeline, leave voice, remove session
                         {
-                            let handle = {
-                                let mut ah = state.audio_handles.lock().await;
-                                ah.remove(&guild_id)
-                            };
-                            if let Some(h) = handle {
-                                h.shutdown().await;
+                            let mut sessions = state.sessions.lock().await;
+                            if let Some(session) = sessions.get_mut(guild_id) {
+                                session.cleanup().await;
                             }
+                            sessions.remove(guild_id);
                         }
                         let _ = manager.leave(guild_id_obj).await;
-                        {
-                            let mut consent_mgr = state.consent.lock().await;
-                            consent_mgr.remove_session(guild_id);
-                        }
-                        {
-                            let mut bundles = state.bundles.lock().await;
-                            bundles.remove(&guild_id);
-                        }
                         component
                             .channel_id
-                            .say(&ctx.http, "⚠️ Unable to receive audio. Try `/record` again.")
+                            .say(&ctx.http, "Unable to receive audio. Try `/record` again.")
                             .await?;
                         return Ok(());
                     }
@@ -473,39 +423,25 @@ async fn handle_consent_button(
 
                     match manager.join(guild_id_obj, channel_id).await {
                         Ok(new_call) => {
-                            // Re-attach to the new Call — same channel, same buffer task
+                            // Re-attach to the new Call — reuses existing audio pipeline
+                            let mut sessions = state.sessions.lock().await;
+                            let session = sessions.get_mut(guild_id).unwrap();
                             let mut handler = new_call.lock().await;
-                            let ssrc_map = AudioReceiver::attach(
-                                &mut handler, audio_tx.clone(), consented_set.clone(), audio_received.clone(),
-                            );
-                            drop(handler);
-
-                            let mut maps = state.ssrc_maps.lock().await;
-                            maps.insert(guild_id, ssrc_map);
+                            session.reattach_audio(&mut handler);
                         }
                         Err(e) => {
                             error!(error = %e, attempt = attempt, "dave_rejoin_failed");
                             // Clean up everything on rejoin failure
                             {
-                                let handle = {
-                                    let mut ah = state.audio_handles.lock().await;
-                                    ah.remove(&guild_id)
-                                };
-                                if let Some(h) = handle {
-                                    h.shutdown().await;
+                                let mut sessions = state.sessions.lock().await;
+                                if let Some(session) = sessions.get_mut(guild_id) {
+                                    session.cleanup().await;
                                 }
-                            }
-                            {
-                                let mut consent_mgr = state.consent.lock().await;
-                                consent_mgr.remove_session(guild_id);
-                            }
-                            {
-                                let mut bundles = state.bundles.lock().await;
-                                bundles.remove(&guild_id);
+                                sessions.remove(guild_id);
                             }
                             component
                                 .channel_id
-                                .say(&ctx.http, "⚠️ Failed to reconnect to voice. Try `/record` again.")
+                                .say(&ctx.http, "Failed to reconnect to voice. Try `/record` again.")
                                 .await?;
                             return Ok(());
                         }
@@ -514,11 +450,8 @@ async fn handle_consent_button(
 
                 // Update consent embed: remove buttons, show recording status
                 let consent_msg = {
-                    let mut consent_mgr = state.consent.lock().await;
-                    if let Some(s) = consent_mgr.get_session_mut(guild_id) {
-                        s.state = SessionState::Recording;
-                    }
-                    consent_mgr.get_session(guild_id).and_then(|s| s.consent_message)
+                    let sessions = state.sessions.lock().await;
+                    sessions.get(guild_id).and_then(|s| s.consent_message)
                 };
                 if let Some((channel_id_msg, message_id)) = consent_msg {
                     let edit = serenity::all::EditMessage::new()
@@ -530,7 +463,7 @@ async fn handle_consent_button(
                     let _ = ctx.http.edit_message(channel_id_msg, message_id, &edit, vec![]).await;
                 }
 
-                // Write Point 3: Update session state to recording in Postgres
+                // Update session state to recording in Postgres
                 if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
                     if let Err(e) = db::update_session_state(&state.db, sid, "recording").await {
                         tracing::error!("DB write failed (update_session_state): {e}");
@@ -551,31 +484,35 @@ async fn handle_consent_button(
                     .say(&ctx.http, "Failed to join voice channel.")
                     .await?;
 
-                let mut consent_mgr = state.consent.lock().await;
-                consent_mgr.remove_session(guild_id);
+                // Remove the session since we couldn't join voice
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(guild_id);
             }
         }
     } else {
-        // Check if quorum failed
-        let manager = state.consent.lock().await;
-        if let Some(session) = manager.get_session(guild_id) {
-            if session.all_responded() && !session.evaluate_quorum() {
-                drop(manager);
-                let mut manager = state.consent.lock().await;
-                manager.remove_session(guild_id);
+        // Check if quorum failed — all responded but not enough accepted
+        let quorum_failed = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(guild_id).is_some_and(|s| {
+                s.all_responded() && !s.evaluate_quorum()
+            })
+        };
 
-                component
-                    .channel_id
-                    .say(
-                        &ctx.http,
-                        "Recording cancelled — consent requirements not met.",
-                    )
-                    .await?;
-            }
+        if quorum_failed {
+            let mut sessions = state.sessions.lock().await;
+            sessions.remove(guild_id);
+
+            component
+                .channel_id
+                .say(
+                    &ctx.http,
+                    "Recording cancelled — consent requirements not met.",
+                )
+                .await?;
         }
     }
 
-    // Write Point 2: Record consent in Postgres (after voice join, non-critical path)
+    // Record consent in Postgres (after voice join, non-critical path)
     {
         let session_uuid = uuid::Uuid::parse_str(&session_id).ok();
         if let Some(sid) = session_uuid {
@@ -590,7 +527,7 @@ async fn handle_consent_button(
         }
     }
 
-    // If scope is Full, send ephemeral license follow-up (non-blocking step 2)
+    // If scope is Full, send ephemeral license follow-up with restriction toggles
     if scope == ConsentScope::Full {
         let followup = CreateInteractionResponseFollowup::new()
             .content("Your audio defaults to **public dataset + LLM training**. Toggle restrictions below:")
@@ -607,8 +544,8 @@ async fn handle_consent_button(
             Ok(msg) => {
                 // Store followup info so we can edit it on session end
                 {
-                    let mut consent_mgr = state.consent.lock().await;
-                    if let Some(session) = consent_mgr.get_session_mut(guild_id) {
+                    let mut sessions = state.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(guild_id) {
                         session.license_followups.push((component.token.clone(), msg.id));
                     }
                 }
@@ -622,9 +559,11 @@ async fn handle_consent_button(
                         .components(vec![]);
                     let _ = http.edit_followup_message(&interaction_token, msg.id, &edit, vec![]).await;
                 });
-                // Store handle so it can be aborted on session end
-                let mut tasks = state.license_cleanup_tasks.lock().await;
-                tasks.entry(guild_id).or_default().push(handle);
+                // Store handle in the session so it can be aborted on session end
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(guild_id) {
+                    session.license_cleanup_tasks.push(handle);
+                }
             }
             Err(e) => {
                 warn!(error = %e, "failed to send license preference followup");
@@ -635,7 +574,7 @@ async fn handle_consent_button(
     Ok(())
 }
 
-/// Write Point 2b: Handle license preference button clicks (toggles).
+/// Handle license preference button clicks (toggles no-LLM / no-public-release).
 async fn handle_license_button(
     ctx: &Context,
     component: &ComponentInteraction,
@@ -651,17 +590,16 @@ async fn handle_license_button(
     };
 
     let session_id_str = {
-        let consent = state.consent.lock().await;
-        consent.get_session(guild_id).map(|s| s.session_id.clone())
+        let sessions = state.sessions.lock().await;
+        sessions.get(guild_id).map(|s| s.id.clone())
     };
 
-    // Toggle the flag and read back current state
+    // Toggle the flag in Postgres and read back current state
     let (no_llm, no_public) = if let Some(sid_str) = &session_id_str {
         if let Ok(sid) = uuid::Uuid::parse_str(sid_str) {
             if let Err(e) = db::toggle_license_flag(&state.db, sid, user_id.get(), field).await {
                 tracing::error!("DB write failed (toggle_license_flag): {e}");
             }
-            // Read back current flags
             db::get_license_flags(&state.db, sid, user_id.get())
                 .await
                 .unwrap_or((false, false))
@@ -672,7 +610,7 @@ async fn handle_license_button(
         (false, false)
     };
 
-    // Re-render buttons only — state expressed through button style, no text clutter
+    // Re-render buttons — state expressed through button style, no text clutter
     let llm_style = if no_llm { ButtonStyle::Danger } else { ButtonStyle::Secondary };
     let public_style = if no_public { ButtonStyle::Danger } else { ButtonStyle::Secondary };
     let llm_label = if no_llm { "No LLM Training ✓" } else { "No LLM Training" };
