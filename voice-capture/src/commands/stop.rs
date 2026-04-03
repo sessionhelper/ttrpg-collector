@@ -2,8 +2,39 @@ use serenity::all::*;
 use tracing::{error, info};
 
 use crate::consent::SessionState;
+use crate::db;
 use crate::state::AppState;
 use crate::storage::pseudonymize;
+
+/// Edit the consent embed and all ephemeral license followups to show session complete.
+async fn cleanup_session_ui(ctx: &Context, state: &AppState, guild_id: u64) {
+    let (consent_msg, license_followups) = {
+        let consent_mgr = state.consent.lock().await;
+        match consent_mgr.get_session(guild_id) {
+            Some(s) => (s.consent_message, s.license_followups.clone()),
+            None => (None, vec![]),
+        }
+    };
+
+    // Clean up the main consent embed
+    if let Some((channel_id, message_id)) = consent_msg {
+        let edit = EditMessage::new()
+            .embed(CreateEmbed::new()
+                .title("Session complete")
+                .description("Recording has ended. Thank you for contributing!")
+                .color(0x8b949e))
+            .components(vec![]);
+        let _ = ctx.http.edit_message(channel_id, message_id, &edit, vec![]).await;
+    }
+
+    // Clean up all ephemeral license followup messages
+    for (token, msg_id) in license_followups {
+        let edit = CreateInteractionResponseFollowup::new()
+            .content("License preferences saved. Change them anytime on the participant portal.")
+            .components(vec![]);
+        let _ = ctx.http.edit_followup_message(&token, msg_id, &edit, vec![]).await;
+    }
+}
 
 pub async fn handle_stop(
     ctx: &Context,
@@ -64,6 +95,9 @@ pub async fn handle_stop(
     // Leave voice channel
     let manager = songbird::get(ctx).await.unwrap();
     let _ = manager.leave(guild_id).await;
+
+    // Clean up consent embed — remove buttons, show "Session complete"
+    cleanup_session_ui(ctx, state, guild_id.get()).await;
 
     // Finalize session
     {
@@ -177,6 +211,7 @@ pub async fn handle_stop(
     };
 
     // Upload to S3
+    let s3_prefix = format!("{}/{}", guild_id_u64, session_id);
     match state
         .s3
         .upload_session(&session_dir, guild_id_u64, &session_id)
@@ -187,6 +222,28 @@ pub async fn handle_stop(
         }
         Err(e) => {
             error!(error = %e, "upload_failed");
+        }
+    }
+
+    // Write Point 4: Finalize session in Postgres
+    if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
+        let participant_count = {
+            let consent_mgr = state.consent.lock().await;
+            consent_mgr
+                .get_session(guild_id.get())
+                .map(|s| s.participants.len() as i32)
+                .unwrap_or(0)
+        };
+        let ended_at = chrono::Utc::now();
+        let finalized = db::FinalizedSession {
+            session_id: sid,
+            ended_at,
+            duration_seconds: 0.0, // duration computed from bundle timestamps
+            participant_count,
+            s3_prefix: Some(s3_prefix),
+        };
+        if let Err(e) = db::finalize_session(&state.db, &finalized).await {
+            error!("DB write failed (finalize_session): {e}");
         }
     }
 
@@ -208,12 +265,17 @@ pub async fn handle_stop(
         let mut maps = state.ssrc_maps.lock().await;
         maps.remove(&guild_id.get());
     }
+    // Abort any pending license button cleanup tasks
+    state.abort_license_cleanups(guild_id.get()).await;
 
     Ok(())
 }
 
 /// Auto-stop when channel empties. No command interaction needed.
 pub async fn auto_stop(ctx: &Context, guild_id: u64, state: &AppState) {
+    // Clean up consent embed before anything else
+    cleanup_session_ui(ctx, state, guild_id).await;
+
     let session_id = {
         let manager = state.consent.lock().await;
         match manager.get_session(guild_id) {
@@ -302,7 +364,29 @@ pub async fn auto_stop(ctx: &Context, guild_id: u64, state: &AppState) {
 
     // Upload
     if let Some((dir, gid)) = session_dir {
+        let s3_prefix = format!("{}/{}", gid, session_id);
         let _ = state.s3.upload_session(&dir, gid, &session_id).await;
+
+        // Write Point 4: Finalize session in Postgres (auto-stop)
+        if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
+            let participant_count = {
+                let consent_mgr = state.consent.lock().await;
+                consent_mgr
+                    .get_session(guild_id)
+                    .map(|s| s.participants.len() as i32)
+                    .unwrap_or(0)
+            };
+            let finalized = db::FinalizedSession {
+                session_id: sid,
+                ended_at: chrono::Utc::now(),
+                duration_seconds: 0.0,
+                participant_count,
+                s3_prefix: Some(s3_prefix),
+            };
+            if let Err(e) = db::finalize_session(&state.db, &finalized).await {
+                error!("DB write failed (finalize_session auto-stop): {e}");
+            }
+        }
 
         // Notify in text channel
         let text_channel = {
@@ -331,4 +415,6 @@ pub async fn auto_stop(ctx: &Context, guild_id: u64, state: &AppState) {
         let mut maps = state.ssrc_maps.lock().await;
         maps.remove(&guild_id);
     }
+    // Abort any pending license button cleanup tasks
+    state.abort_license_cleanups(guild_id).await;
 }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use serenity::all::UserId;
+use serenity::all::{ChannelId, MessageId, UserId};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SessionState {
@@ -40,6 +40,10 @@ pub struct ConsentSession {
     pub participants: HashMap<UserId, ParticipantConsent>,
     pub min_participants: usize,
     pub require_all: bool,
+    /// Message ID of the consent embed, so we can clean it up on session end
+    pub consent_message: Option<(ChannelId, MessageId)>,
+    /// Interaction tokens + message IDs for ephemeral license followups, so we can edit them on session end
+    pub license_followups: Vec<(String, MessageId)>,
 }
 
 impl ConsentSession {
@@ -62,6 +66,8 @@ impl ConsentSession {
             participants: HashMap::new(),
             min_participants,
             require_all,
+            consent_message: None,
+            license_followups: Vec::new(),
         }
     }
 

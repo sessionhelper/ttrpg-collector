@@ -1,7 +1,9 @@
 use serenity::all::*;
+use tracing::error;
 
 use crate::consent::*;
 use crate::consent::embeds::consent_buttons;
+use crate::db;
 use crate::state::AppState;
 
 pub async fn handle_record(
@@ -84,23 +86,6 @@ pub async fn handle_record(
         return Ok(());
     }
 
-    // Parse optional command options
-    let system = command
-        .data
-        .options
-        .iter()
-        .find(|o| o.name == "system")
-        .and_then(|o| o.value.as_str())
-        .map(String::from);
-
-    let campaign = command
-        .data
-        .options
-        .iter()
-        .find(|o| o.name == "campaign")
-        .and_then(|o| o.value.as_str())
-        .map(String::from);
-
     // Create session
     let session_id = uuid::Uuid::new_v4().to_string();
     let mut session = ConsentSession::new(
@@ -125,9 +110,47 @@ pub async fn handle_record(
             &state.config.local_buffer_dir,
             guild_id.get(),
         );
-        bundle.game_system = system;
-        bundle.campaign_name = campaign;
         bundles.insert(guild_id.get(), bundle);
+    }
+
+    // Write Point 1: Create session and add participants in Postgres
+    if let Ok(session_uuid) = uuid::Uuid::parse_str(&session_id) {
+        // Read game info from the bundle we just stored
+        let new_session = db::NewSession {
+            id: session_uuid,
+            guild_id: guild_id.get() as i64,
+            started_at: chrono::Utc::now(),
+            game_system: None,
+            campaign_name: None,
+        };
+
+        if let Err(e) = db::create_session(&state.db, &new_session).await {
+            error!("DB write failed (create_session): {e}");
+        }
+
+        // Add each participant, checking blocklist first
+        for (uid, _name) in &members {
+            match db::check_blocklist(&state.db, uid.get()).await {
+                Ok(true) => {
+                    tracing::info!(user_id = %uid, "participant_blocked — user opted out globally, skipping");
+                    continue;
+                }
+                Err(e) => {
+                    error!("DB read failed (check_blocklist): {e}");
+                    // Continue — allow participant if DB is down
+                }
+                _ => {}
+            }
+
+            let participant = db::NewParticipant {
+                session_id: session_uuid,
+                discord_user_id: uid.get(),
+                mid_session_join: false,
+            };
+            if let Err(e) = db::add_participant(&state.db, &participant).await {
+                error!("DB write failed (add_participant): {e}");
+            }
+        }
     }
 
     let embed = build_consent_embed(&session);
@@ -139,12 +162,8 @@ pub async fn handle_record(
         .collect::<Vec<_>>()
         .join(" ");
 
-    {
-        let mut manager = state.consent.lock().await;
-        manager.create_session(session);
-    }
-
-    command
+    // Respond to Discord FIRST — if this fails, don't store the session
+    let response_result = command
         .create_response(
             &ctx.http,
             CreateInteractionResponse::Message(
@@ -154,7 +173,25 @@ pub async fn handle_record(
                     .components(vec![buttons]),
             ),
         )
-        .await?;
+        .await;
+
+    match response_result {
+        Ok(_) => {
+            // Store the consent message ID so we can clean it up on session end
+            if let Ok(msg) = command.get_response(&ctx.http).await {
+                session.consent_message = Some((msg.channel_id, msg.id));
+            }
+            // Only store the session after Discord accepted the response
+            let mut manager = state.consent.lock().await;
+            manager.create_session(session);
+        }
+        Err(e) => {
+            // Clean up the bundle since we won't have a session
+            let mut bundles = state.bundles.lock().await;
+            bundles.remove(&guild_id.get());
+            return Err(e);
+        }
+    }
 
     Ok(())
 }

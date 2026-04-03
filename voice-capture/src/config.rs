@@ -38,4 +38,8 @@ pub struct Config {
     /// S3 chunk size in bytes before flushing (default 50MB)
     #[arg(long, env = "S3_CHUNK_SIZE", default_value = "52428800")]
     pub s3_chunk_size: usize,
+
+    /// Postgres database URL
+    #[arg(long, env = "DATABASE_URL")]
+    pub database_url: String,
 }

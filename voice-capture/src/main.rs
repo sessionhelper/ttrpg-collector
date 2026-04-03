@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod consent;
+mod db;
 mod state;
 mod storage;
 mod voice;
@@ -39,23 +40,7 @@ impl EventHandler for Handler {
                     &ctx.http,
                     vec![
                         CreateCommand::new("record")
-                            .description("Start recording this voice channel for the TTRPG dataset")
-                            .add_option(
-                                CreateCommandOption::new(
-                                    CommandOptionType::String,
-                                    "system",
-                                    "Game system (e.g., D&D 5e)",
-                                )
-                                .required(false),
-                            )
-                            .add_option(
-                                CreateCommandOption::new(
-                                    CommandOptionType::String,
-                                    "campaign",
-                                    "Campaign name",
-                                )
-                                .required(false),
-                            ),
+                            .description("Start recording this voice channel for the Open Voice Project"),
                         CreateCommand::new("stop")
                             .description("Stop the current recording session"),
                     ],
@@ -84,6 +69,16 @@ impl EventHandler for Handler {
             Interaction::Component(component) => {
                 if let Err(e) = handle_consent_button(&ctx, &component, &self.state).await {
                     error!(error = %e, "consent_button_error");
+                    // Clean up stale session on interaction failure
+                    if let Some(gid) = component.guild_id {
+                        let mut manager = self.state.consent.lock().await;
+                        if let Some(session) = manager.get_session(gid.get()) {
+                            if session.state == SessionState::AwaitingConsent {
+                                info!(guild_id = %gid, "cleaning_up_stale_session");
+                                manager.remove_session(gid.get());
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -137,17 +132,49 @@ impl EventHandler for Handler {
             };
 
             if !already_participant {
+                // Write Point 5: Check blocklist before adding mid-session joiner
+                match db::check_blocklist(&self.state.db, user_id.get()).await {
+                    Ok(true) => {
+                        info!(user_id = %user_id, "mid_session_joiner_blocked — user opted out globally");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("DB read failed (check_blocklist): {e}");
+                        // Continue — allow join if DB is down
+                    }
+                    _ => {}
+                }
+
                 let display_name = guild
                     .members
                     .get(&user_id)
                     .map(|m| m.display_name().to_string())
                     .unwrap_or_else(|| format!("User {}", user_id));
 
+                // Get session_id for DB write
+                let session_id_str = {
+                    let consent = self.state.consent.lock().await;
+                    consent.get_session(guild_id.get()).map(|s| s.session_id.clone())
+                };
+
                 // Add as mid-session joiner
                 {
                     let mut consent = self.state.consent.lock().await;
                     if let Some(session) = consent.get_session_mut(guild_id.get()) {
                         session.add_participant(user_id, display_name.clone(), true);
+                    }
+                }
+
+                // Write Point 5: Add mid-session participant to Postgres
+                if let Some(sid_str) = &session_id_str {
+                    if let Ok(sid) = uuid::Uuid::parse_str(sid_str) {
+                        if let Err(e) = db::add_participant(&self.state.db, &db::NewParticipant {
+                            session_id: sid,
+                            discord_user_id: user_id.get(),
+                            mid_session_join: true,
+                        }).await {
+                            tracing::error!("DB write failed (add_participant mid-session): {e}");
+                        }
                     }
                 }
 
@@ -242,6 +269,9 @@ async fn handle_consent_button(
     let scope = match component.data.custom_id.as_str() {
         "consent_accept" => ConsentScope::Full,
         "consent_decline" => ConsentScope::Decline,
+        "license_no_llm" | "license_no_public" => {
+            return handle_license_button(ctx, component, state).await;
+        }
         _ => return Ok(()),
     };
 
@@ -297,17 +327,7 @@ async fn handle_consent_button(
         (should_start, is_mid_session_accept, embed, session_id, channel_id)
     };
 
-    // Mid-session joiner accepted — add to consented_users so their audio is captured
-    if is_mid_session_accept {
-        let cu = state.consented_users.lock().await;
-        if let Some(set) = cu.get(&guild_id) {
-            let mut set = set.lock().await;
-            set.insert(user_id.get());
-            info!(user_id = %user_id, "mid_session_consent_granted — audio capture enabled");
-        }
-    }
-
-    // Update the embed
+    // Acknowledge the interaction FIRST (Discord 3-second deadline)
     component
         .create_response(
             &ctx.http,
@@ -318,6 +338,16 @@ async fn handle_consent_button(
             ),
         )
         .await?;
+
+    // Mid-session joiner accepted — add to consented_users so their audio is captured
+    if is_mid_session_accept {
+        let cu = state.consented_users.lock().await;
+        if let Some(set) = cu.get(&guild_id) {
+            let mut set = set.lock().await;
+            set.insert(user_id.get());
+            info!(user_id = %user_id, "mid_session_consent_granted — audio capture enabled");
+        }
+    }
 
     if should_start {
         info!("quorum_met — joining voice channel");
@@ -367,10 +397,28 @@ async fn handle_consent_button(
                     maps.insert(guild_id, ssrc_map);
                 }
 
-                {
+                // Update consent embed: remove buttons, show recording status
+                let consent_msg = {
                     let mut consent_mgr = state.consent.lock().await;
                     if let Some(s) = consent_mgr.get_session_mut(guild_id) {
                         s.state = SessionState::Recording;
+                    }
+                    consent_mgr.get_session(guild_id).and_then(|s| s.consent_message)
+                };
+                if let Some((channel_id_msg, message_id)) = consent_msg {
+                    let edit = serenity::all::EditMessage::new()
+                        .embed(CreateEmbed::new()
+                            .title("Recording in progress")
+                            .description("All participants accepted. Recording is active.")
+                            .color(0x238636))
+                        .components(vec![]);
+                    let _ = ctx.http.edit_message(channel_id_msg, message_id, &edit, vec![]).await;
+                }
+
+                // Write Point 3: Update session state to recording in Postgres
+                if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
+                    if let Err(e) = db::update_session_state(&state.db, sid, "recording").await {
+                        tracing::error!("DB write failed (update_session_state): {e}");
                     }
                 }
 
@@ -412,6 +460,127 @@ async fn handle_consent_button(
         }
     }
 
+    // Write Point 2: Record consent in Postgres (after voice join, non-critical path)
+    {
+        let session_uuid = uuid::Uuid::parse_str(&session_id).ok();
+        if let Some(sid) = session_uuid {
+            let scope_str = match scope {
+                ConsentScope::Full => "full",
+                ConsentScope::Decline => "decline",
+                ConsentScope::DeclineAudio => "decline_audio",
+            };
+            if let Err(e) = db::record_consent(&state.db, sid, user_id.get(), scope_str).await {
+                tracing::error!("DB write failed (record_consent): {e}");
+            }
+        }
+    }
+
+    // If scope is Full, send ephemeral license follow-up (non-blocking step 2)
+    if scope == ConsentScope::Full {
+        let followup = CreateInteractionResponseFollowup::new()
+            .content("Your audio defaults to **public dataset + LLM training**. Toggle restrictions below:")
+            .ephemeral(true)
+            .components(vec![CreateActionRow::Buttons(vec![
+                CreateButton::new("license_no_llm")
+                    .label("No LLM Training")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("license_no_public")
+                    .label("No Public Release")
+                    .style(ButtonStyle::Secondary),
+            ])]);
+        match component.create_followup(&ctx.http, followup).await {
+            Ok(msg) => {
+                // Store followup info so we can edit it on session end
+                {
+                    let mut consent_mgr = state.consent.lock().await;
+                    if let Some(session) = consent_mgr.get_session_mut(guild_id) {
+                        session.license_followups.push((component.token.clone(), msg.id));
+                    }
+                }
+                // Remove buttons before the 15-minute interaction token expires
+                let http = ctx.http.clone();
+                let interaction_token = component.token.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(14 * 60)).await;
+                    let edit = CreateInteractionResponseFollowup::new()
+                        .content("License preferences saved. Change them anytime on the participant portal.")
+                        .components(vec![]);
+                    let _ = http.edit_followup_message(&interaction_token, msg.id, &edit, vec![]).await;
+                });
+                // Store handle so it can be aborted on session end
+                let mut tasks = state.license_cleanup_tasks.lock().await;
+                tasks.entry(guild_id).or_default().push(handle);
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to send license preference followup");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Write Point 2b: Handle license preference button clicks (toggles).
+async fn handle_license_button(
+    ctx: &Context,
+    component: &ComponentInteraction,
+    state: &AppState,
+) -> Result<(), serenity::Error> {
+    let guild_id = component.guild_id.unwrap().get();
+    let user_id = component.user.id;
+
+    let field = match component.data.custom_id.as_str() {
+        "license_no_llm" => "no_llm_training",
+        "license_no_public" => "no_public_release",
+        _ => return Ok(()),
+    };
+
+    let session_id_str = {
+        let consent = state.consent.lock().await;
+        consent.get_session(guild_id).map(|s| s.session_id.clone())
+    };
+
+    // Toggle the flag and read back current state
+    let (no_llm, no_public) = if let Some(sid_str) = &session_id_str {
+        if let Ok(sid) = uuid::Uuid::parse_str(sid_str) {
+            if let Err(e) = db::toggle_license_flag(&state.db, sid, user_id.get(), field).await {
+                tracing::error!("DB write failed (toggle_license_flag): {e}");
+            }
+            // Read back current flags
+            db::get_license_flags(&state.db, sid, user_id.get())
+                .await
+                .unwrap_or((false, false))
+        } else {
+            (false, false)
+        }
+    } else {
+        (false, false)
+    };
+
+    // Re-render buttons only — state expressed through button style, no text clutter
+    let llm_style = if no_llm { ButtonStyle::Danger } else { ButtonStyle::Secondary };
+    let public_style = if no_public { ButtonStyle::Danger } else { ButtonStyle::Secondary };
+    let llm_label = if no_llm { "No LLM Training ✓" } else { "No LLM Training" };
+    let public_label = if no_public { "No Public Release ✓" } else { "No Public Release" };
+
+    component
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::UpdateMessage(
+                CreateInteractionResponseMessage::new()
+                    .content("Toggle restrictions on your audio:")
+                    .components(vec![CreateActionRow::Buttons(vec![
+                        CreateButton::new("license_no_llm")
+                            .label(llm_label)
+                            .style(llm_style),
+                        CreateButton::new("license_no_public")
+                            .label(public_label)
+                            .style(public_style),
+                    ])]),
+            ),
+        )
+        .await?;
+
     Ok(())
 }
 
@@ -437,7 +606,26 @@ async fn main() {
 
     info!("starting_bot");
 
-    let state = Arc::new(AppState::new(config));
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .expect("Failed to connect to Postgres");
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .expect("Failed to run database migrations");
+
+    // Clean up any sessions left in non-terminal states from a previous crash
+    let abandoned = sqlx::query_scalar::<_, i64>(
+        "UPDATE sessions SET status = 'abandoned' WHERE status IN ('awaiting_consent', 'recording', 'finalizing') RETURNING 1"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
+    if !abandoned.is_empty() {
+        info!(count = abandoned.len(), "cleaned_up_abandoned_sessions");
+    }
+
+    let state = Arc::new(AppState::new(config, pool));
 
     let intents = GatewayIntents::non_privileged()
         | GatewayIntents::GUILD_VOICE_STATES

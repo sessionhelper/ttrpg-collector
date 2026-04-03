@@ -3,8 +3,8 @@ use serenity::all::{CreateEmbed, CreateButton, ButtonStyle, CreateActionRow};
 use super::manager::{ConsentSession, ConsentScope};
 
 const CONSENT_TEXT: &str = "\
-This session will be recorded for the **TTRPG Open Dataset** project \
-and released under **CC BY-SA 4.0**.\n\n\
+This session will be recorded for the **Open Voice Project**.\n\n\
+After accepting, you can set restrictions on how your audio is used.\n\n\
 You can decline without leaving the voice channel.";
 
 pub fn build_consent_embed(session: &ConsentSession) -> CreateEmbed {

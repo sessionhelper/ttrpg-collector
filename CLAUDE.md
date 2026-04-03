@@ -2,12 +2,19 @@
 
 Discord bot for collecting TTRPG session audio for an open dataset.
 
+## Code Style
+
+- Add comments that explain **why**, not what. Every function should have a brief doc comment explaining its purpose and rationale.
+- Complex logic blocks should have inline comments explaining the reasoning — especially Discord API quirks, timing constraints, and error handling decisions.
+- Keep comments concise but sufficient for someone reading the code for the first time to understand the intent.
+
 ## Stack
 
 - Rust (serenity + songbird)
 - songbird `next` branch for DAVE E2EE voice receive
 - aws-sdk-s3 for S3-compatible uploads (Hetzner Object Storage)
-- ffmpeg for PCM → FLAC conversion
+- sqlx 0.8 for Postgres
+- No ffmpeg — raw PCM uploaded to S3, pipeline crate handles audio processing
 
 ## Layout
 
@@ -53,9 +60,15 @@ cargo run --release
 
 ## Git Workflow
 
-- **main** — production, deploys to VPS on push
-- **dev** — integration branch
-- **feature/*** — branch from dev, merge back via --no-ff
+- **main** — production. Only receives merges from `dev`. Tag to deploy.
+- **dev** — integration branch. Feature branches merge here first.
+- **feature/*** — branch from `dev`, merge back to `dev` via `--no-ff`
+
+**Never commit directly to main or dev. Never merge feature branches directly to main.**
+
+```
+feature/foo → dev (--no-ff) → main (--no-ff) → tag v0.x.x → CI/CD deploy
+```
 
 ## Key Decisions
 

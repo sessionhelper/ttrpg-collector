@@ -60,14 +60,34 @@ impl AudioReceiver {
 impl VoiceEventHandler for AudioReceiver {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(VoiceTick {
-            speaking, silent: _, ..
+            speaking, silent, ..
         }) = ctx
         {
+            // DEBUG: log tick activity
+            if !speaking.is_empty() || !silent.is_empty() {
+                tracing::debug!(
+                    speaking_count = speaking.len(),
+                    silent_count = silent.len(),
+                    "voice_tick"
+                );
+            }
+
             let mut writers = self.writers.lock().await;
             let ssrc_map = self.ssrc_to_user.lock().await;
             let consented = self.consented_users.lock().await;
 
             for (ssrc, data) in speaking {
+                // DEBUG: log what we're getting per SSRC
+                let has_decoded = data.decoded_voice.is_some();
+                let mapped = ssrc_map.contains_key(ssrc);
+                if !has_decoded || !mapped {
+                    tracing::debug!(
+                        ssrc = ssrc,
+                        has_decoded = has_decoded,
+                        mapped = mapped,
+                        "voice_tick_skip"
+                    );
+                }
                 // Only write audio for consented users
                 if let Some(user_id) = ssrc_map.get(ssrc) {
                     if !consented.contains(user_id) {
