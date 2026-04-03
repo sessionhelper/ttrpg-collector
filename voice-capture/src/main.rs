@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod consent;
 mod db;
+mod telemetry;
 mod session;
 mod state;
 mod storage;
@@ -255,6 +256,7 @@ impl EventHandler for Handler {
 
 /// Handle consent Accept/Decline button clicks.
 /// Uses one lock on `state.sessions` to read and mutate session state.
+#[tracing::instrument(skip_all, fields(guild_id = component.guild_id.map(|g| g.get()), user_id = %component.user.id))]
 async fn handle_consent_button(
     ctx: &Context,
     component: &ComponentInteraction,
@@ -271,6 +273,13 @@ async fn handle_consent_button(
         }
         _ => return Ok(()),
     };
+
+    let scope_label = match scope {
+        ConsentScope::Full => "full",
+        ConsentScope::Decline => "decline",
+        ConsentScope::DeclineAudio => "decline_audio",
+    };
+    metrics::counter!("ttrpg_consent_responses_total", "scope" => scope_label).increment(1);
 
     // Lock sessions once, record consent, and extract everything we need
     let (should_start, is_mid_session_accept, embed, session_id, channel_id) = {
@@ -372,6 +381,7 @@ async fn handle_consent_button(
                 // Wait for DAVE to deliver decoded audio — retry voice join if needed
                 const DAVE_WAIT_SECS: u64 = 5;
                 const MAX_ATTEMPTS: u32 = 3;
+                let dave_start = std::time::Instant::now();
 
                 for attempt in 1..=MAX_ATTEMPTS {
                     info!(attempt = attempt, "waiting_for_dave");
@@ -387,7 +397,9 @@ async fn handle_consent_button(
                     };
 
                     if has_audio {
-                        info!(attempt = attempt, "dave_audio_confirmed");
+                        let dave_elapsed = dave_start.elapsed().as_secs_f64();
+                        info!(attempt = attempt, dave_secs = dave_elapsed, "dave_audio_confirmed");
+                        metrics::counter!("ttrpg_dave_attempts_total", "outcome" => "success").increment(1);
                         break;
                     }
 
@@ -398,11 +410,14 @@ async fn handle_consent_button(
                         session.has_ssrc().await
                     };
                     if has_ssrc {
-                        info!(attempt = attempt, "dave_connection_confirmed — ssrc mapped, awaiting speech");
+                        let dave_elapsed = dave_start.elapsed().as_secs_f64();
+                        info!(attempt = attempt, dave_secs = dave_elapsed, "dave_connection_confirmed — ssrc mapped, awaiting speech");
+                        metrics::counter!("ttrpg_dave_attempts_total", "outcome" => "success").increment(1);
                         break;
                     }
 
                     if attempt == MAX_ATTEMPTS {
+                        metrics::counter!("ttrpg_dave_attempts_total", "outcome" => "failure").increment(1);
                         warn!("dave_failed — no audio or ssrc after {MAX_ATTEMPTS} attempts");
                         // Clean up: shut down audio pipeline, leave voice, remove session
                         {
@@ -474,6 +489,7 @@ async fn handle_consent_button(
                     tracing::error!("DB write failed (update_session_state): {e}");
                 }
 
+                metrics::gauge!("ttrpg_sessions_active").increment(1.0);
                 info!(session_id = %session_id, "recording_started");
 
                 component
@@ -483,6 +499,7 @@ async fn handle_consent_button(
             }
             Err(e) => {
                 error!(error = %e, "voice_join_failed");
+                metrics::counter!("ttrpg_sessions_total", "outcome" => "failed").increment(1);
                 component
                     .channel_id
                     .say(&ctx.http, "Failed to join voice channel.")
@@ -503,6 +520,7 @@ async fn handle_consent_button(
         };
 
         if quorum_failed {
+            metrics::counter!("ttrpg_sessions_total", "outcome" => "cancelled").increment(1);
             let mut sessions = state.sessions.lock().await;
             sessions.remove(guild_id);
 
@@ -579,6 +597,7 @@ async fn handle_consent_button(
 }
 
 /// Handle license preference button clicks (toggles no-LLM / no-public-release).
+#[tracing::instrument(skip_all, fields(guild_id = component.guild_id.map(|g| g.get()), user_id = %component.user.id))]
 async fn handle_license_button(
     ctx: &Context,
     component: &ComponentInteraction,
@@ -657,6 +676,18 @@ async fn main() {
                 .add_directive("serenity=warn".parse().unwrap()),
         )
         .init();
+
+    // Metrics are recorded via the metrics crate facade.
+    // A Prometheus exporter can be enabled with the `prometheus` feature.
+    #[cfg(feature = "prometheus")]
+    {
+        let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+        builder
+            .install()
+            .expect("Failed to install Prometheus exporter");
+    }
+
+    telemetry::describe_metrics();
 
     let config = Config::parse();
     let token = config.token.clone();

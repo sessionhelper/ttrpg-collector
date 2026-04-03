@@ -164,8 +164,9 @@ impl Session {
 
     // --- Phase transitions ---
 
-    /// Transition from AwaitingConsent → Recording.
+    /// Transition from AwaitingConsent -> Recording.
     /// Creates the audio pipeline and returns the channel sender for DAVE retries.
+    #[tracing::instrument(skip_all, fields(session_id = %self.id, guild_id = self.guild_id))]
     pub fn start_recording(
         &mut self,
         call: &mut songbird::Call,
@@ -223,7 +224,8 @@ impl Session {
         }
     }
 
-    /// Transition from Recording → Finalizing. Shuts down audio pipeline.
+    /// Transition from Recording -> Finalizing. Shuts down audio pipeline.
+    #[tracing::instrument(skip_all, fields(session_id = %self.id))]
     pub async fn finalize(&mut self) {
         self.ended_at = Some(Utc::now());
 

@@ -12,6 +12,7 @@ use crate::state::AppState;
 /// participants, and sends the consent embed. The session is only stored
 /// after Discord accepts the response — if the Discord call fails, no
 /// orphaned state is left behind.
+#[tracing::instrument(skip(ctx, command, state), fields(guild_id = %command.guild_id.unwrap()))]
 pub async fn handle_record(
     ctx: &Context,
     command: &CommandInteraction,
@@ -168,6 +169,7 @@ pub async fn handle_record(
 
     match response_result {
         Ok(_) => {
+            metrics::counter!("ttrpg_sessions_total", "outcome" => "started").increment(1);
             // Store the consent message ID so we can clean it up on session end
             if let Ok(msg) = command.get_response(&ctx.http).await {
                 session.consent_message = Some((msg.channel_id, msg.id));

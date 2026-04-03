@@ -9,6 +9,7 @@ use crate::state::AppState;
 
 /// Edit the consent embed and all ephemeral license followups to show session complete.
 /// Takes a reference to the Session to read consent_message and license_followups.
+#[tracing::instrument(skip_all, fields(session_id = %session.id))]
 async fn cleanup_session_ui(ctx: &Context, session: &Session) {
     if let Some((channel_id, message_id)) = session.consent_message {
         let edit = EditMessage::new()
@@ -31,6 +32,7 @@ async fn cleanup_session_ui(ctx: &Context, session: &Session) {
 /// Flush remaining audio buffers to S3 and upload metadata.
 /// Transitions the session through Finalizing -> uploading metadata.
 /// Shared by both /stop and auto-stop.
+#[tracing::instrument(skip_all, fields(guild_id = guild_id))]
 async fn finalize_session(
     _ctx: &Context,
     state: &AppState,
@@ -65,13 +67,26 @@ async fn finalize_session(
     let meta_key = format!("{}/meta.json", s3_prefix_base);
     let consent_key = format!("{}/consent.json", s3_prefix_base);
 
-    if let Err(e) = state.s3.upload_bytes(&meta_key, meta_json).await {
-        error!(error = %e, "meta_upload_failed");
+    match state.s3.upload_bytes(&meta_key, meta_json).await {
+        Ok(_) => {
+            metrics::counter!("ttrpg_s3_uploads_total", "type" => "meta", "outcome" => "success").increment(1);
+        }
+        Err(e) => {
+            error!(error = %e, "meta_upload_failed");
+            metrics::counter!("ttrpg_s3_uploads_total", "type" => "meta", "outcome" => "failure").increment(1);
+        }
     }
-    if let Err(e) = state.s3.upload_bytes(&consent_key, consent_json).await {
-        error!(error = %e, "consent_upload_failed");
+    match state.s3.upload_bytes(&consent_key, consent_json).await {
+        Ok(_) => {
+            metrics::counter!("ttrpg_s3_uploads_total", "type" => "consent", "outcome" => "success").increment(1);
+        }
+        Err(e) => {
+            error!(error = %e, "consent_upload_failed");
+            metrics::counter!("ttrpg_s3_uploads_total", "type" => "consent", "outcome" => "failure").increment(1);
+        }
     }
 
+    metrics::gauge!("ttrpg_sessions_active").decrement(1.0);
     info!(session_id = %session_id, "session_finalized");
 
     // Finalize session in Postgres
@@ -101,6 +116,7 @@ async fn finalize_session(
 /// Handle the /stop slash command.
 /// Only the initiator can stop the session. Transitions through
 /// Finalizing, uploads metadata, then removes the session.
+#[tracing::instrument(skip(ctx, command, state), fields(guild_id = %command.guild_id.unwrap()))]
 pub async fn handle_stop(
     ctx: &Context,
     command: &CommandInteraction,
@@ -179,6 +195,7 @@ pub async fn handle_stop(
 }
 
 /// Auto-stop when channel empties. No command interaction — called from voice_state_update.
+#[tracing::instrument(skip_all, fields(guild_id = guild_id))]
 pub async fn auto_stop(ctx: &Context, guild_id: u64, state: &AppState) {
     // Clean up Discord UI before finalizing
     let text_channel = {

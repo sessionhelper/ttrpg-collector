@@ -42,6 +42,7 @@ pub struct FinalizedSession {
 // ---------------------------------------------------------------------------
 
 /// INSERT a new session row.
+#[tracing::instrument(skip_all, fields(session_id = %s.id))]
 pub async fn create_session(pool: &PgPool, s: &NewSession) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO sessions (id, guild_id, started_at, game_system, campaign_name, status)
@@ -53,12 +54,19 @@ pub async fn create_session(pool: &PgPool, s: &NewSession) -> Result<(), sqlx::E
     .bind(&s.game_system)
     .bind(&s.campaign_name)
     .execute(pool)
-    .await?;
+    .await
+    .inspect(|_| {
+        metrics::counter!("ttrpg_db_writes_total", "operation" => "create_session", "outcome" => "success").increment(1);
+    })
+    .inspect_err(|_| {
+        metrics::counter!("ttrpg_db_writes_total", "operation" => "create_session", "outcome" => "failure").increment(1);
+    })?;
     Ok(())
 }
 
 /// Ensure the user exists in the `users` table, then add them to
 /// `session_participants`.
+#[tracing::instrument(skip_all, fields(session_id = %p.session_id))]
 pub async fn add_participant(pool: &PgPool, p: &NewParticipant) -> Result<(), sqlx::Error> {
     let pseudo_id = pseudonymize(p.discord_user_id);
     let discord_id_hash = pseudo_id.clone(); // same SHA-256 derivation
@@ -90,13 +98,20 @@ pub async fn add_participant(pool: &PgPool, p: &NewParticipant) -> Result<(), sq
     .bind(user_id)
     .bind(p.mid_session_join)
     .execute(pool)
-    .await?;
+    .await
+    .inspect(|_| {
+        metrics::counter!("ttrpg_db_writes_total", "operation" => "add_participant", "outcome" => "success").increment(1);
+    })
+    .inspect_err(|_| {
+        metrics::counter!("ttrpg_db_writes_total", "operation" => "add_participant", "outcome" => "failure").increment(1);
+    })?;
 
     Ok(())
 }
 
 /// Record a consent decision: update the participant row and append an
 /// audit-log entry.
+#[tracing::instrument(skip_all, fields(session_id = %session_id))]
 pub async fn record_consent(
     pool: &PgPool,
     session_id: Uuid,
@@ -141,12 +156,19 @@ pub async fn record_consent(
     .bind(&previous_scope)
     .bind(scope)
     .execute(pool)
-    .await?;
+    .await
+    .inspect(|_| {
+        metrics::counter!("ttrpg_db_writes_total", "operation" => "record_consent", "outcome" => "success").increment(1);
+    })
+    .inspect_err(|_| {
+        metrics::counter!("ttrpg_db_writes_total", "operation" => "record_consent", "outcome" => "failure").increment(1);
+    })?;
 
     Ok(())
 }
 
 /// Toggle a license flag (no_llm_training or no_public_release) for a participant.
+#[tracing::instrument(skip_all, fields(session_id = %session_id))]
 pub async fn toggle_license_flag(
     pool: &PgPool,
     session_id: Uuid,
@@ -181,6 +203,7 @@ pub async fn toggle_license_flag(
 }
 
 /// Read current license flags for a participant.
+#[tracing::instrument(skip_all, fields(session_id = %session_id))]
 pub async fn get_license_flags(
     pool: &PgPool,
     session_id: Uuid,
@@ -203,6 +226,7 @@ pub async fn get_license_flags(
 }
 
 /// Update session status (e.g. awaiting_consent -> recording).
+#[tracing::instrument(skip_all, fields(session_id = %session_id))]
 pub async fn update_session_state(
     pool: &PgPool,
     session_id: Uuid,
@@ -212,11 +236,18 @@ pub async fn update_session_state(
         .bind(state)
         .bind(session_id)
         .execute(pool)
-        .await?;
+        .await
+        .inspect(|_| {
+            metrics::counter!("ttrpg_db_writes_total", "operation" => "update_session_state", "outcome" => "success").increment(1);
+        })
+        .inspect_err(|_| {
+            metrics::counter!("ttrpg_db_writes_total", "operation" => "update_session_state", "outcome" => "failure").increment(1);
+        })?;
     Ok(())
 }
 
 /// Write final session metadata after recording stops.
+#[tracing::instrument(skip_all, fields(session_id = %f.session_id))]
 pub async fn finalize_session(pool: &PgPool, f: &FinalizedSession) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE sessions
@@ -231,12 +262,19 @@ pub async fn finalize_session(pool: &PgPool, f: &FinalizedSession) -> Result<(),
     .bind(&f.s3_prefix)
     .bind(f.session_id)
     .execute(pool)
-    .await?;
+    .await
+    .inspect(|_| {
+        metrics::counter!("ttrpg_db_writes_total", "operation" => "finalize_session", "outcome" => "success").increment(1);
+    })
+    .inspect_err(|_| {
+        metrics::counter!("ttrpg_db_writes_total", "operation" => "finalize_session", "outcome" => "failure").increment(1);
+    })?;
     Ok(())
 }
 
 /// Check if a user has opted out globally.
 /// Returns `true` if the user is blocked (opted out).
+#[tracing::instrument(skip_all)]
 pub async fn check_blocklist(pool: &PgPool, discord_user_id: u64) -> Result<bool, sqlx::Error> {
     let pseudo_id = pseudonymize(discord_user_id);
 
