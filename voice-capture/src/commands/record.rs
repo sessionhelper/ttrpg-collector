@@ -1,3 +1,5 @@
+//! `/record` slash command handler.
+
 use serenity::all::*;
 use tracing::error;
 

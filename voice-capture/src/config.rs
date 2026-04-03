@@ -1,5 +1,8 @@
+//! CLI / environment variable configuration via clap.
+
 use clap::Parser;
 
+/// Bot configuration, populated from CLI args or environment variables.
 #[derive(Parser, Clone)]
 #[command(name = "ttrpg-collector", about = "TTRPG session audio collector bot")]
 pub struct Config {

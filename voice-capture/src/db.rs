@@ -1,3 +1,8 @@
+//! Postgres persistence layer.
+//!
+//! All SQL lives here — the rest of the crate calls these functions
+//! and never touches sqlx directly.
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -8,6 +13,7 @@ use crate::storage::pseudonymize;
 // Helper structs
 // ---------------------------------------------------------------------------
 
+/// Data needed to INSERT a new session row.
 pub struct NewSession {
     pub id: Uuid,
     pub guild_id: i64,
@@ -16,16 +22,17 @@ pub struct NewSession {
     pub campaign_name: Option<String>,
 }
 
+/// Data needed to INSERT a new participant row.
 pub struct NewParticipant {
     pub session_id: Uuid,
     pub discord_user_id: u64,
     pub mid_session_join: bool,
 }
 
+/// Data written when a session ends (recording -> complete).
 pub struct FinalizedSession {
     pub session_id: Uuid,
     pub ended_at: DateTime<Utc>,
-    pub duration_seconds: f64,
     pub participant_count: i32,
     pub s3_prefix: Option<String>,
 }

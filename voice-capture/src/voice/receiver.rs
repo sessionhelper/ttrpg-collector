@@ -1,3 +1,9 @@
+//! Audio capture pipeline: VoiceTick handler, per-speaker buffering, and S3 upload.
+//!
+//! The hot path (VoiceTick) is kept lock-free by sending audio packets through
+//! an mpsc channel to a background buffer task. The buffer task accumulates
+//! per-speaker PCM data and uploads chunks to S3 when they reach the threshold.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -73,6 +79,7 @@ impl SpeakerBuffer {
     }
 }
 
+/// A buffered PCM chunk ready for S3 upload.
 struct ChunkToUpload {
     pseudo_id: String,
     seq: u32,
@@ -289,14 +296,14 @@ struct SpeakingTracker {
 #[async_trait]
 impl VoiceEventHandler for SpeakingTracker {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::SpeakingStateUpdate(speaking) = ctx {
-            if let Some(uid) = speaking.user_id {
-                let mut map = self.ssrc_to_user.lock().await;
-                if !map.contains_key(&speaking.ssrc) {
-                    info!(ssrc = speaking.ssrc, user_id = %uid, "ssrc_mapped");
-                }
-                map.insert(speaking.ssrc, uid.0);
+        if let EventContext::SpeakingStateUpdate(speaking) = ctx
+            && let Some(uid) = speaking.user_id
+        {
+            let mut map = self.ssrc_to_user.lock().await;
+            if !map.contains_key(&speaking.ssrc) {
+                info!(ssrc = speaking.ssrc, user_id = %uid, "ssrc_mapped");
             }
+            map.insert(speaking.ssrc, uid.0);
         }
         None
     }

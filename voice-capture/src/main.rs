@@ -1,3 +1,7 @@
+//! TTRPG session audio collector Discord bot.
+//!
+//! Entry point, serenity event handlers, and consent button logic.
+
 mod commands;
 mod config;
 mod consent;
@@ -21,6 +25,7 @@ use crate::config::Config;
 use crate::session::{consent_buttons, ConsentScope, Phase};
 use crate::state::AppState;
 
+/// Serenity event handler. Dispatches slash commands, button clicks, and voice state changes.
 struct Handler {
     state: Arc<AppState>,
 }
@@ -70,11 +75,11 @@ impl EventHandler for Handler {
                     // Clean up stale session on interaction failure — only if still awaiting consent
                     if let Some(gid) = component.guild_id {
                         let mut sessions = self.state.sessions.lock().await;
-                        if let Some(session) = sessions.get(gid.get()) {
-                            if matches!(session.phase, Phase::AwaitingConsent) {
-                                info!(guild_id = %gid, "cleaning_up_stale_session");
-                                sessions.remove(gid.get());
-                            }
+                        if let Some(session) = sessions.get(gid.get())
+                            && matches!(session.phase, Phase::AwaitingConsent)
+                        {
+                            info!(guild_id = %gid, "cleaning_up_stale_session");
+                            sessions.remove(gid.get());
                         }
                     }
                 }
@@ -157,16 +162,15 @@ impl EventHandler for Handler {
                 };
 
                 // Persist mid-session participant to Postgres
-                if let Some(sid_str) = &session_id_str {
-                    if let Ok(sid) = uuid::Uuid::parse_str(sid_str) {
-                        if let Err(e) = db::add_participant(&self.state.db, &db::NewParticipant {
-                            session_id: sid,
-                            discord_user_id: user_id.get(),
-                            mid_session_join: true,
-                        }).await {
-                            tracing::error!("DB write failed (add_participant mid-session): {e}");
-                        }
-                    }
+                if let Some(sid_str) = &session_id_str
+                    && let Ok(sid) = uuid::Uuid::parse_str(sid_str)
+                    && let Err(e) = db::add_participant(&self.state.db, &db::NewParticipant {
+                        session_id: sid,
+                        discord_user_id: user_id.get(),
+                        mid_session_join: true,
+                    }).await
+                {
+                    tracing::error!("DB write failed (add_participant mid-session): {e}");
                 }
 
                 info!(user_id = %user_id, name = %display_name, "mid_session_joiner");
@@ -337,12 +341,12 @@ async fn handle_consent_button(
     // Mid-session joiner accepted — add to consented_users so their audio is captured
     if is_mid_session_accept {
         let sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get(guild_id) {
-            if let Phase::Recording { consented_users, .. } = &session.phase {
-                let mut set = consented_users.lock().await;
-                set.insert(user_id.get());
-                info!(user_id = %user_id, "mid_session_consent_granted — audio capture enabled");
-            }
+        if let Some(session) = sessions.get(guild_id)
+            && let Phase::Recording { consented_users, .. } = &session.phase
+        {
+            let mut set = consented_users.lock().await;
+            set.insert(user_id.get());
+            info!(user_id = %user_id, "mid_session_consent_granted — audio capture enabled");
         }
     }
 
@@ -464,10 +468,10 @@ async fn handle_consent_button(
                 }
 
                 // Update session state to recording in Postgres
-                if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
-                    if let Err(e) = db::update_session_state(&state.db, sid, "recording").await {
-                        tracing::error!("DB write failed (update_session_state): {e}");
-                    }
+                if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
+                    && let Err(e) = db::update_session_state(&state.db, sid, "recording").await
+                {
+                    tracing::error!("DB write failed (update_session_state): {e}");
                 }
 
                 info!(session_id = %session_id, "recording_started");

@@ -1,3 +1,5 @@
+//! Voice audio capture: receiver, buffering, and SSRC tracking.
+
 pub mod receiver;
 
-pub use receiver::{AudioReceiver, AudioHandle, AudioPacket};
+pub use receiver::{AudioHandle, AudioPacket, AudioReceiver};

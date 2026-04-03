@@ -1,3 +1,5 @@
+//! `/stop` slash command and auto-stop handler.
+
 use serenity::all::*;
 use tracing::{error, info};
 
@@ -77,7 +79,6 @@ async fn finalize_session(
         let finalized = db::FinalizedSession {
             session_id: sid,
             ended_at: chrono::Utc::now(),
-            duration_seconds: 0.0,
             participant_count,
             s3_prefix: Some(s3_prefix_base),
         };

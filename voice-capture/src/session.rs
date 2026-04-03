@@ -116,6 +116,7 @@ impl Session {
 
     // --- Participant management ---
 
+    /// Add a participant (idempotent — skips if already present).
     pub fn add_participant(&mut self, user_id: UserId, display_name: String, mid_session: bool) {
         self.participants.entry(user_id).or_insert(ParticipantConsent {
             user_id,
@@ -126,6 +127,7 @@ impl Session {
         });
     }
 
+    /// Record a participant's consent choice.
     pub fn record_consent(&mut self, user_id: UserId, scope: ConsentScope) {
         if let Some(p) = self.participants.get_mut(&user_id) {
             p.scope = Some(scope);
@@ -133,14 +135,17 @@ impl Session {
         }
     }
 
+    /// True if every participant has responded (accepted or declined).
     pub fn all_responded(&self) -> bool {
         self.participants.values().all(|p| p.scope.is_some())
     }
 
+    /// True if any participant declined.
     pub fn has_decline(&self) -> bool {
         self.participants.values().any(|p| p.scope == Some(ConsentScope::Decline))
     }
 
+    /// User IDs of participants who gave full consent.
     pub fn consented_user_ids(&self) -> Vec<UserId> {
         self.participants
             .values()
@@ -149,6 +154,7 @@ impl Session {
             .collect()
     }
 
+    /// Check whether enough participants consented to start recording.
     pub fn evaluate_quorum(&self) -> bool {
         if self.require_all && self.has_decline() {
             return false;
@@ -397,26 +403,32 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Create an empty session manager.
     pub fn new() -> Self {
         Self { sessions: HashMap::new() }
     }
 
+    /// Store a session, keyed by guild ID.
     pub fn insert(&mut self, session: Session) {
         self.sessions.insert(session.guild_id, session);
     }
 
+    /// Look up a session by guild ID.
     pub fn get(&self, guild_id: u64) -> Option<&Session> {
         self.sessions.get(&guild_id)
     }
 
+    /// Look up a session mutably by guild ID.
     pub fn get_mut(&mut self, guild_id: u64) -> Option<&mut Session> {
         self.sessions.get_mut(&guild_id)
     }
 
+    /// Remove and return a session by guild ID.
     pub fn remove(&mut self, guild_id: u64) -> Option<Session> {
         self.sessions.remove(&guild_id)
     }
 
+    /// True if the guild has a session in a non-terminal phase.
     pub fn has_active(&self, guild_id: u64) -> bool {
         self.sessions.get(&guild_id).is_some_and(|s| {
             matches!(s.phase, Phase::AwaitingConsent | Phase::Recording { .. } | Phase::Finalizing)
