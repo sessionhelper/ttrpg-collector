@@ -1,3 +1,3 @@
-mod receiver;
+pub mod receiver;
 
-pub use receiver::AudioReceiver;
+pub use receiver::{AudioReceiver, AudioHandle, AudioPacket};
