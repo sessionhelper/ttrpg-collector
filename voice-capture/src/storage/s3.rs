@@ -39,6 +39,42 @@ impl S3Uploader {
         }
     }
 
+    /// Upload raw bytes to S3 at the given key. Used for PCM audio chunks.
+    pub async fn upload_bytes(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let size = data.len();
+        for attempt in 1..=3 {
+            let body = ByteStream::from(data.clone());
+            match self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .content_type("application/octet-stream")
+                .body(body)
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    info!(key = %key, size = size, attempt = attempt, "bytes_uploaded");
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempt == 3 {
+                        error!(key = %key, error = %e, "bytes_upload_failed");
+                        return Err(Box::new(e));
+                    }
+                    let backoff = std::time::Duration::from_secs(1 << (attempt - 1));
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Upload all files in a session directory to S3.
     /// Returns the number of files uploaded.
     pub async fn upload_session(

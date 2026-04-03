@@ -387,14 +387,129 @@ async fn handle_consent_button(
                     cu.insert(guild_id, consented_set.clone());
                 }
 
-                info!(output_dir = %output_dir.display(), "registering_audio_receiver");
+                // Create audio pipeline ONCE — channel + buffer task
+                let audio_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let s3_prefix = format!("sessions/{}/{}/audio", guild_id, session_id);
+                let (audio_tx, audio_handle) = AudioReceiver::create_pipeline(
+                    state.s3.clone(), s3_prefix.clone(),
+                );
 
-                let mut handler = call.lock().await;
-                let ssrc_map = AudioReceiver::register(&mut handler, output_dir, consented_set);
+                info!(s3_prefix = %s3_prefix, "registering_audio_receiver");
 
+                // Attach to the Songbird Call (wires VoiceTick → channel)
                 {
+                    let mut handler = call.lock().await;
+                    let ssrc_map = AudioReceiver::attach(
+                        &mut handler, audio_tx.clone(), consented_set.clone(), audio_received.clone(),
+                    );
                     let mut maps = state.ssrc_maps.lock().await;
                     maps.insert(guild_id, ssrc_map);
+                    let mut ah = state.audio_handles.lock().await;
+                    ah.insert(guild_id, audio_handle);
+                }
+
+                // Wait for DAVE to deliver decoded audio — retry voice join if needed
+                const DAVE_WAIT_SECS: u64 = 5;
+                const MAX_ATTEMPTS: u32 = 3;
+
+                for attempt in 1..=MAX_ATTEMPTS {
+                    info!(attempt = attempt, "waiting_for_dave");
+                    tokio::time::sleep(std::time::Duration::from_secs(DAVE_WAIT_SECS)).await;
+
+                    // Check if decoded audio arrived (someone was speaking)
+                    if audio_received.load(std::sync::atomic::Ordering::Relaxed) {
+                        info!(attempt = attempt, "dave_audio_confirmed");
+                        break;
+                    }
+
+                    // Also check if SSRC mapping arrived — DAVE is working,
+                    // just nobody spoke during the check window
+                    let has_ssrc = {
+                        let maps = state.ssrc_maps.lock().await;
+                        if let Some(m) = maps.get(&guild_id) {
+                            let inner = m.lock().await;
+                            !inner.is_empty()
+                        } else {
+                            false
+                        }
+                    };
+                    if has_ssrc {
+                        info!(attempt = attempt, "dave_connection_confirmed — ssrc mapped, awaiting speech");
+                        break;
+                    }
+
+                    if attempt == MAX_ATTEMPTS {
+                        warn!("dave_failed — no audio or ssrc after {MAX_ATTEMPTS} attempts");
+                        // Clean up: shut down buffer task, leave voice, remove state
+                        {
+                            let handle = {
+                                let mut ah = state.audio_handles.lock().await;
+                                ah.remove(&guild_id)
+                            };
+                            if let Some(h) = handle {
+                                h.shutdown().await;
+                            }
+                        }
+                        let _ = manager.leave(guild_id_obj).await;
+                        {
+                            let mut consent_mgr = state.consent.lock().await;
+                            consent_mgr.remove_session(guild_id);
+                        }
+                        {
+                            let mut bundles = state.bundles.lock().await;
+                            bundles.remove(&guild_id);
+                        }
+                        component
+                            .channel_id
+                            .say(&ctx.http, "⚠️ Unable to receive audio. Try `/record` again.")
+                            .await?;
+                        return Ok(());
+                    }
+
+                    // Leave and rejoin to re-negotiate DAVE encryption
+                    info!(attempt = attempt, "dave_retry — reconnecting voice");
+                    let _ = manager.leave(guild_id_obj).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                    match manager.join(guild_id_obj, channel_id).await {
+                        Ok(new_call) => {
+                            // Re-attach to the new Call — same channel, same buffer task
+                            let mut handler = new_call.lock().await;
+                            let ssrc_map = AudioReceiver::attach(
+                                &mut handler, audio_tx.clone(), consented_set.clone(), audio_received.clone(),
+                            );
+                            drop(handler);
+
+                            let mut maps = state.ssrc_maps.lock().await;
+                            maps.insert(guild_id, ssrc_map);
+                        }
+                        Err(e) => {
+                            error!(error = %e, attempt = attempt, "dave_rejoin_failed");
+                            // Clean up everything on rejoin failure
+                            {
+                                let handle = {
+                                    let mut ah = state.audio_handles.lock().await;
+                                    ah.remove(&guild_id)
+                                };
+                                if let Some(h) = handle {
+                                    h.shutdown().await;
+                                }
+                            }
+                            {
+                                let mut consent_mgr = state.consent.lock().await;
+                                consent_mgr.remove_session(guild_id);
+                            }
+                            {
+                                let mut bundles = state.bundles.lock().await;
+                                bundles.remove(&guild_id);
+                            }
+                            component
+                                .channel_id
+                                .say(&ctx.http, "⚠️ Failed to reconnect to voice. Try `/record` again.")
+                                .await?;
+                            return Ok(());
+                        }
+                    }
                 }
 
                 // Update consent embed: remove buttons, show recording status
