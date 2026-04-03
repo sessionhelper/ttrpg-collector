@@ -39,18 +39,25 @@ voice-capture/
   src/
     main.rs              — entry point, serenity client, event handlers
     config.rs            — env var config (clap)
-    state.rs             — shared app state
+    state.rs             — simplified AppState (sessions, s3, db)
+    session.rs           — unified Session struct, Phase enum, consent, metadata serialization
+    telemetry.rs         — metrics descriptions (counters, gauges, histograms)
+    db.rs                — Postgres data access layer
     commands/
       record.rs          — /record slash command
-      stop.rs            — /stop slash command (finalize + upload)
-    consent/
-      manager.rs         — consent state machine, quorum logic
-      embeds.rs          — Discord embed + button builders
+      stop.rs            — /stop + auto-stop (finalize + S3 upload)
     voice/
-      receiver.rs        — VoiceTick handler, per-user PCM to disk, SSRC tracking
+      receiver.rs        — channel-based audio pipeline, chunked S3 upload, DAVE detection
     storage/
-      bundle.rs          — meta.json, consent.json, pseudonymization
-      s3.rs              — S3 upload with retry
+      bundle.rs          — serialization structs, pseudonymization
+      s3.rs              — S3 upload_bytes with retry
+  assets/
+    recording_started.wav — TTS clip played on recording start
+    recording_stopped.wav — TTS clip played on /stop
+  migrations/
+    001_initial.sql      — users, sessions, participants, audit log
+    002_transcripts.sql  — segments, flags, edits
+  build.rs               — git version string (tag/branch-hash-dirty)
   Cargo.toml
 scripts/
   sync-s3.sh             — download S3 data locally
