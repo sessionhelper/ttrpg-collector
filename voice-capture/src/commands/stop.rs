@@ -171,8 +171,18 @@ pub async fn handle_stop(
         )
         .await?;
 
-    // Leave voice channel — stops audio capture at the Songbird level
+    // Play "Recording complete" announcement before leaving voice
     let manager = songbird::get(ctx).await.unwrap();
+    if let Some(call) = manager.get(guild_id) {
+        let mut handler = call.lock().await;
+        let source = songbird::input::File::new("/assets/recording_stopped.wav");
+        let _ = handler.play_input(source.into());
+        drop(handler);
+        // Wait for clip to play (~2 seconds)
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    // Leave voice channel — stops audio capture at the Songbird level
     let _ = manager.leave(guild_id).await;
 
     // Clean up Discord UI (consent embed, license followups) before removing session

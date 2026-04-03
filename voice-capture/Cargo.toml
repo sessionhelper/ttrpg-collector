@@ -20,6 +20,9 @@ songbird = { git = "https://github.com/serenity-rs/songbird.git", branch = "next
     "receive", "driver"
 ] }
 
+# Audio codec support for Songbird file playback
+symphonia = { version = "0.5", features = ["wav", "pcm", "ogg", "vorbis"] }
+
 # Async
 tokio = { version = "1", features = ["full"] }
 

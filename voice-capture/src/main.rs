@@ -245,6 +245,16 @@ impl EventHandler for Handler {
                 if still_empty {
                     info!(guild_id = %guild_id, "auto_stop — channel empty for 30s");
                     let manager = songbird::get(&ctx_clone).await.unwrap();
+
+                    // Play "Recording complete" announcement before leaving
+                    if let Some(call) = manager.get(guild_id) {
+                        let mut handler = call.lock().await;
+                        let source = songbird::input::File::new("/assets/recording_stopped.wav");
+                        let _ = handler.play_input(source.into());
+                        drop(handler);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+
                     let _ = manager.leave(guild_id).await;
 
                     commands::stop::auto_stop(&ctx_clone, guild_id.get(), &state).await;
@@ -466,6 +476,16 @@ async fn handle_consent_button(
                         }
                     }
                 }
+
+                // Play "Recording has begun" announcement
+                {
+                    let call = manager.get(guild_id_obj).unwrap();
+                    let mut handler = call.lock().await;
+                    let source = songbird::input::File::new("/assets/recording_started.wav");
+                    let _ = handler.play_input(source.into());
+                }
+                // Brief pause to let the clip play before we start capturing
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
                 // Update consent embed: remove buttons, show recording status
                 let consent_msg = {
@@ -692,7 +712,10 @@ async fn main() {
     let config = Config::parse();
     let token = config.token.clone();
 
-    info!("starting_bot");
+    info!(
+        version = option_env!("BUILD_VERSION").unwrap_or("dev"),
+        "starting_bot"
+    );
 
     let pool = sqlx::PgPool::connect(&config.database_url)
         .await

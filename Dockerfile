@@ -15,5 +15,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/ttrpg-collector /usr/local/bin/ttrpg-collector
+COPY voice-capture/assets/ /assets/
 
 CMD ["ttrpg-collector"]

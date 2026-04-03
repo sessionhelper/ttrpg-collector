@@ -3,6 +3,7 @@ voice-capture/target/
 sessions/
 *.flac
 *.wav
+!voice-capture/assets/*.wav
 *.pcm
 test-sessions/
 junk/
