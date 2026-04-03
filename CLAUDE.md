@@ -4,9 +4,25 @@ Discord bot for collecting TTRPG session audio for an open dataset.
 
 ## Code Style
 
+Follow [Rust Design Patterns](https://rust-unofficial.github.io/patterns/) and [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/).
+
+**Readability:**
 - Add comments that explain **why**, not what. Every function should have a brief doc comment explaining its purpose and rationale.
-- Complex logic blocks should have inline comments explaining the reasoning — especially Discord API quirks, timing constraints, and error handling decisions.
-- Keep comments concise but sufficient for someone reading the code for the first time to understand the intent.
+- Complex logic blocks should have inline comments — especially Discord API quirks, timing constraints, and error handling decisions.
+- Keep comments concise but sufficient for someone reading the code for the first time.
+
+**Patterns:**
+- Use `Result` + `?` for error propagation — keep the happy path flat, no nested if/match chains.
+- Use enums with data for state machines — match on state, don't if-check fields.
+- Use iterators over manual loops. Use `filter`, `map`, `for_each` over index-based iteration.
+- Use the typestate pattern when invalid transitions should be compile errors.
+- Avoid premature abstraction — three similar lines beats a premature generic.
+
+**Anti-patterns (don't do these):**
+- No deeply nested if-statements — flatten with early returns and `?`.
+- No stringly-typed state — use enums.
+- No scattered state across multiple HashMaps — use a struct that owns its data.
+- No manual mutex juggling for hot paths — use channels.
 
 ## Stack
 
