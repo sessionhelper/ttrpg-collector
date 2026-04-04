@@ -512,6 +512,51 @@ async fn handle_consent_button(
                     .channel_id
                     .say(&ctx.http, "Recording. Use `/stop` when done.")
                     .await?;
+
+                // Send license preference buttons now that recording is active.
+                // Uses the original interaction's followup window (15 min from consent ack).
+                if scope == ConsentScope::Full {
+                    let followup = CreateInteractionResponseFollowup::new()
+                        .content("Your audio defaults to **public dataset + LLM training**. Toggle restrictions below:")
+                        .ephemeral(true)
+                        .components(vec![CreateActionRow::Buttons(vec![
+                            CreateButton::new("license_no_llm")
+                                .label("No LLM Training")
+                                .style(ButtonStyle::Secondary),
+                            CreateButton::new("license_no_public")
+                                .label("No Public Release")
+                                .style(ButtonStyle::Secondary),
+                        ])]);
+                    match component.create_followup(&ctx.http, followup).await {
+                        Ok(msg) => {
+                            {
+                                let mut sessions = state.sessions.lock().await;
+                                if let Some(session) = sessions.get_mut(guild_id) {
+                                    session.license_followups.push((component.token.clone(), msg.id));
+                                }
+                            }
+                            let http = ctx.http.clone();
+                            let interaction_token = component.token.clone();
+                            let handle = tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(14 * 60)).await;
+                                let edit = serenity::all::EditInteractionResponse::new()
+                                    .components(vec![]);
+                                let _ = http
+                                    .edit_followup_message(&interaction_token, msg.id, &edit, vec![])
+                                    .await;
+                            });
+                            {
+                                let mut sessions = state.sessions.lock().await;
+                                if let Some(session) = sessions.get_mut(guild_id) {
+                                    session.license_cleanup_tasks.push(handle);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "license_followup_failed");
+                        }
+                    }
+                }
             }
             Err(e) => {
                 error!(error = %e, "voice_join_failed");
@@ -561,50 +606,6 @@ async fn handle_consent_button(
             };
             if let Err(e) = state.api.record_consent(sid, user_id.get(), scope_str).await {
                 tracing::error!("API call failed (record_consent): {e}");
-            }
-        }
-    }
-
-    // If scope is Full, send ephemeral license follow-up with restriction toggles
-    if scope == ConsentScope::Full {
-        let followup = CreateInteractionResponseFollowup::new()
-            .content("Your audio defaults to **public dataset + LLM training**. Toggle restrictions below:")
-            .ephemeral(true)
-            .components(vec![CreateActionRow::Buttons(vec![
-                CreateButton::new("license_no_llm")
-                    .label("No LLM Training")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new("license_no_public")
-                    .label("No Public Release")
-                    .style(ButtonStyle::Secondary),
-            ])]);
-        match component.create_followup(&ctx.http, followup).await {
-            Ok(msg) => {
-                // Store followup info so we can edit it on session end
-                {
-                    let mut sessions = state.sessions.lock().await;
-                    if let Some(session) = sessions.get_mut(guild_id) {
-                        session.license_followups.push((component.token.clone(), msg.id));
-                    }
-                }
-                // Remove buttons before the 15-minute interaction token expires
-                let http = ctx.http.clone();
-                let interaction_token = component.token.clone();
-                let handle = tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(14 * 60)).await;
-                    let edit = CreateInteractionResponseFollowup::new()
-                        .content("License preferences saved. Change them anytime on the participant portal.")
-                        .components(vec![]);
-                    let _ = http.edit_followup_message(&interaction_token, msg.id, &edit, vec![]).await;
-                });
-                // Store handle in the session so it can be aborted on session end
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(guild_id) {
-                    session.license_cleanup_tasks.push(handle);
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to send license preference followup");
             }
         }
     }
