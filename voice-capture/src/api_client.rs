@@ -113,7 +113,7 @@ struct UpdateLicenseRequest {
 
 #[derive(Serialize)]
 struct AuthRequest {
-    admission_token: String,
+    shared_secret: String,
     service_name: String,
 }
 
@@ -135,16 +135,14 @@ pub enum ApiError {
     Http(#[from] reqwest::Error),
     #[error("API returned {status}: {body}")]
     Status { status: u16, body: String },
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 impl DataApiClient {
-    /// Authenticate with the Data API using an admission token read from a file.
+    /// Authenticate with the Data API using a shared secret.
     /// Returns a client ready to make authenticated requests.
     pub async fn authenticate(
         base_url: &str,
-        admission_token: &str,
+        shared_secret: &str,
         service_name: &str,
     ) -> Result<Self, ApiError> {
         let client = reqwest::Client::new();
@@ -152,7 +150,7 @@ impl DataApiClient {
         let resp = client
             .post(format!("{base_url}/internal/auth"))
             .json(&AuthRequest {
-                admission_token: admission_token.to_string(),
+                shared_secret: shared_secret.to_string(),
                 service_name: service_name.to_string(),
             })
             .send()

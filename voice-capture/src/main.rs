@@ -717,17 +717,7 @@ async fn main() {
     );
 
     // Authenticate with the Data API
-    let admission_token = std::fs::read_to_string(&config.data_api_admission_path)
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to read admission token from {}: {e}",
-                config.data_api_admission_path
-            )
-        })
-        .trim()
-        .to_string();
-
-    let api = DataApiClient::authenticate(&config.data_api_url, &admission_token, "bot")
+    let api = DataApiClient::authenticate(&config.data_api_url, &config.data_api_shared_secret, "bot")
         .await
         .expect("Failed to authenticate with Data API");
 

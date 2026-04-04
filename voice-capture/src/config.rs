@@ -14,9 +14,9 @@ pub struct Config {
     #[arg(long, env = "DATA_API_URL", default_value = "http://127.0.0.1:8001")]
     pub data_api_url: String,
 
-    /// Path to admission token file for Data API auth
-    #[arg(long, env = "DATA_API_ADMISSION_PATH", default_value = "/var/run/ovp/admission-token")]
-    pub data_api_admission_path: String,
+    /// Shared secret for Data API auth
+    #[arg(long, env = "DATA_API_SHARED_SECRET")]
+    pub data_api_shared_secret: String,
 
     /// Local buffer directory
     #[arg(long, env = "LOCAL_BUFFER_DIR", default_value = "./sessions")]
