@@ -3,7 +3,6 @@
 use serenity::all::*;
 use tracing::error;
 
-use crate::db;
 use crate::session::{consent_buttons, Session};
 use crate::state::AppState;
 
@@ -107,40 +106,43 @@ pub async fn handle_record(
         session.add_participant(*uid, name.clone(), false);
     }
 
-    // Persist session and participants to Postgres (non-blocking, best-effort)
+    // Persist session and participants to Data API (non-blocking, best-effort)
     if let Ok(session_uuid) = uuid::Uuid::parse_str(&session.id) {
-        let new_session = db::NewSession {
-            id: session_uuid,
-            guild_id: guild_id.get() as i64,
-            started_at: chrono::Utc::now(),
-            game_system: None,
-            campaign_name: None,
-        };
-
-        if let Err(e) = db::create_session(&state.db, &new_session).await {
-            error!("DB write failed (create_session): {e}");
+        let s3_prefix = format!("sessions/{}/{}", guild_id.get(), session.id);
+        if let Err(e) = state
+            .api
+            .create_session(
+                session_uuid,
+                guild_id.get() as i64,
+                chrono::Utc::now(),
+                None,
+                None,
+                Some(s3_prefix),
+            )
+            .await
+        {
+            error!("API call failed (create_session): {e}");
         }
 
         // Add each participant, checking blocklist first
         for (uid, _name) in &members {
-            match db::check_blocklist(&state.db, uid.get()).await {
+            match state.api.check_blocklist(uid.get()).await {
                 Ok(true) => {
                     tracing::info!(user_id = %uid, "participant_blocked — user opted out globally, skipping");
                     continue;
                 }
                 Err(e) => {
-                    error!("DB read failed (check_blocklist): {e}");
+                    error!("API call failed (check_blocklist): {e}");
                 }
                 _ => {}
             }
 
-            let participant = db::NewParticipant {
-                session_id: session_uuid,
-                discord_user_id: uid.get(),
-                mid_session_join: false,
-            };
-            if let Err(e) = db::add_participant(&state.db, &participant).await {
-                error!("DB write failed (add_participant): {e}");
+            if let Err(e) = state
+                .api
+                .add_participant(session_uuid, uid.get(), false)
+                .await
+            {
+                error!("API call failed (add_participant): {e}");
             }
         }
     }

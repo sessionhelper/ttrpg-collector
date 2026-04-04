@@ -11,10 +11,9 @@
 //! - `ttrpg_dave_attempts_total` — per DAVE retry attempt, labeled by `outcome`
 //!   (success, failure)
 //! - `ttrpg_audio_packets_received` — total decoded voice packets from VoiceTick
-//! - `ttrpg_audio_chunks_uploaded` — successful S3 chunk uploads
+//! - `ttrpg_audio_chunks_uploaded` — successful chunk uploads via Data API
 //! - `ttrpg_consent_responses_total` — labeled by `scope` (full, decline, decline_audio)
-//! - `ttrpg_db_writes_total` — labeled by `operation` and `outcome` (success, failure)
-//! - `ttrpg_s3_uploads_total` — labeled by `type` (chunk, meta, consent) and `outcome`
+//! - `ttrpg_uploads_total` — labeled by `type` (chunk, metadata) and `outcome`
 //!
 //! ## Gauges
 //!
@@ -23,7 +22,7 @@
 //!
 //! ## Histograms
 //!
-//! - `ttrpg_audio_chunk_upload_seconds` — time per chunk upload to S3
+//! - `ttrpg_audio_chunk_upload_seconds` — time per chunk upload to Data API
 
 use metrics::{describe_counter, describe_gauge, describe_histogram};
 
@@ -51,22 +50,18 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "ttrpg_audio_chunks_uploaded",
-        "Successful S3 audio chunk uploads"
+        "Successful audio chunk uploads via Data API"
     );
     describe_histogram!(
         "ttrpg_audio_chunk_upload_seconds",
-        "Time per audio chunk upload to S3"
+        "Time per audio chunk upload to Data API"
     );
     describe_counter!(
         "ttrpg_consent_responses_total",
         "Consent responses, labeled by scope"
     );
     describe_counter!(
-        "ttrpg_db_writes_total",
-        "Database write operations, labeled by operation and outcome"
-    );
-    describe_counter!(
-        "ttrpg_s3_uploads_total",
-        "S3 upload operations, labeled by type and outcome"
+        "ttrpg_uploads_total",
+        "Data API upload operations, labeled by type and outcome"
     );
 }

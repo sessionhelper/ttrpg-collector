@@ -37,10 +37,9 @@ serde_json = "1"
 sha2 = "0.10"
 hex = "0.4"
 
-# S3 upload
-aws-sdk-s3 = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-credential-types = "1"
+# HTTP client (Data API)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+thiserror = "2"
 
 # Logging + telemetry
 tracing = "0.1"
@@ -52,12 +51,10 @@ metrics-exporter-prometheus = { version = "0.16", optional = true }
 rustls = { version = "0.23", features = ["ring"] }
 
 # Utils
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 
-# Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate"] }
 
 [features]
 prometheus = ["dep:metrics-exporter-prometheus"]

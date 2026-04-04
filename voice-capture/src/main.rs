@@ -2,10 +2,9 @@
 //!
 //! Entry point, serenity event handlers, and consent button logic.
 
+mod api_client;
 mod commands;
 mod config;
-mod consent;
-mod db;
 mod telemetry;
 mod session;
 mod state;
@@ -22,6 +21,7 @@ use songbird::serenity::register_from_config;
 use songbird::Config as SongbirdConfig;
 use tracing::{error, info, warn};
 
+use crate::api_client::DataApiClient;
 use crate::config::Config;
 use crate::session::{consent_buttons, ConsentScope, Phase};
 use crate::state::AppState;
@@ -133,14 +133,14 @@ impl EventHandler for Handler {
 
             if !already_participant {
                 // Check blocklist before adding mid-session joiner
-                match db::check_blocklist(&self.state.db, user_id.get()).await {
+                match self.state.api.check_blocklist(user_id.get()).await {
                     Ok(true) => {
                         info!(user_id = %user_id, "mid_session_joiner_blocked — user opted out globally");
                         return;
                     }
                     Err(e) => {
-                        tracing::error!("DB read failed (check_blocklist): {e}");
-                        // Continue — allow join if DB is down
+                        tracing::error!("API call failed (check_blocklist): {e}");
+                        // Continue — allow join if API is down
                     }
                     _ => {}
                 }
@@ -151,7 +151,7 @@ impl EventHandler for Handler {
                     .map(|m| m.display_name().to_string())
                     .unwrap_or_else(|| format!("User {}", user_id));
 
-                // Add as mid-session joiner and get session ID for DB write
+                // Add as mid-session joiner and get session ID for API call
                 let session_id_str = {
                     let mut sessions = self.state.sessions.lock().await;
                     if let Some(session) = sessions.get_mut(guild_id.get()) {
@@ -162,16 +162,12 @@ impl EventHandler for Handler {
                     }
                 };
 
-                // Persist mid-session participant to Postgres
+                // Persist mid-session participant via Data API
                 if let Some(sid_str) = &session_id_str
                     && let Ok(sid) = uuid::Uuid::parse_str(sid_str)
-                    && let Err(e) = db::add_participant(&self.state.db, &db::NewParticipant {
-                        session_id: sid,
-                        discord_user_id: user_id.get(),
-                        mid_session_join: true,
-                    }).await
+                    && let Err(e) = self.state.api.add_participant(sid, user_id.get(), true).await
                 {
-                    tracing::error!("DB write failed (add_participant mid-session): {e}");
+                    tracing::error!("API call failed (add_participant mid-session): {e}");
                 }
 
                 info!(user_id = %user_id, name = %display_name, "mid_session_joiner");
@@ -383,7 +379,7 @@ async fn handle_consent_button(
                     let mut sessions = state.sessions.lock().await;
                     let session = sessions.get_mut(guild_id).unwrap();
                     let mut handler = call.lock().await;
-                    session.start_recording(&mut handler, state.s3.clone())
+                    session.start_recording(&mut handler, state.api.clone())
                 };
 
                 info!(session_id = %session_id, "registering_audio_receiver");
@@ -502,11 +498,11 @@ async fn handle_consent_button(
                     let _ = ctx.http.edit_message(channel_id_msg, message_id, &edit, vec![]).await;
                 }
 
-                // Update session state to recording in Postgres
+                // Update session state via Data API
                 if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
-                    && let Err(e) = db::update_session_state(&state.db, sid, "recording").await
+                    && let Err(e) = state.api.update_session_state(sid, "recording").await
                 {
-                    tracing::error!("DB write failed (update_session_state): {e}");
+                    tracing::error!("API call failed (update_session_state): {e}");
                 }
 
                 metrics::gauge!("ttrpg_sessions_active").increment(1.0);
@@ -554,7 +550,7 @@ async fn handle_consent_button(
         }
     }
 
-    // Record consent in Postgres (after voice join, non-critical path)
+    // Record consent via Data API (after voice join, non-critical path)
     {
         let session_uuid = uuid::Uuid::parse_str(&session_id).ok();
         if let Some(sid) = session_uuid {
@@ -563,8 +559,8 @@ async fn handle_consent_button(
                 ConsentScope::Decline => "decline",
                 ConsentScope::DeclineAudio => "decline_audio",
             };
-            if let Err(e) = db::record_consent(&state.db, sid, user_id.get(), scope_str).await {
-                tracing::error!("DB write failed (record_consent): {e}");
+            if let Err(e) = state.api.record_consent(sid, user_id.get(), scope_str).await {
+                tracing::error!("API call failed (record_consent): {e}");
             }
         }
     }
@@ -637,13 +633,15 @@ async fn handle_license_button(
         sessions.get(guild_id).map(|s| s.id.clone())
     };
 
-    // Toggle the flag in Postgres and read back current state
+    // Toggle the flag via Data API and read back current state
     let (no_llm, no_public) = if let Some(sid_str) = &session_id_str {
         if let Ok(sid) = uuid::Uuid::parse_str(sid_str) {
-            if let Err(e) = db::toggle_license_flag(&state.db, sid, user_id.get(), field).await {
-                tracing::error!("DB write failed (toggle_license_flag): {e}");
+            if let Err(e) = state.api.toggle_license_flag(sid, user_id.get(), field).await {
+                tracing::error!("API call failed (toggle_license_flag): {e}");
             }
-            db::get_license_flags(&state.db, sid, user_id.get())
+            state
+                .api
+                .get_license_flags(sid, user_id.get())
                 .await
                 .unwrap_or((false, false))
         } else {
@@ -717,26 +715,37 @@ async fn main() {
         "starting_bot"
     );
 
-    let pool = sqlx::PgPool::connect(&config.database_url)
-        .await
-        .expect("Failed to connect to Postgres");
-    sqlx::migrate!()
-        .run(&pool)
-        .await
-        .expect("Failed to run database migrations");
+    // Authenticate with the Data API
+    let admission_token = std::fs::read_to_string(&config.data_api_admission_path)
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to read admission token from {}: {e}",
+                config.data_api_admission_path
+            )
+        })
+        .trim()
+        .to_string();
 
-    // Clean up any sessions left in non-terminal states from a previous crash
-    let abandoned = sqlx::query_scalar::<_, i64>(
-        "UPDATE sessions SET status = 'abandoned' WHERE status IN ('awaiting_consent', 'recording', 'finalizing') RETURNING 1"
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
-    if !abandoned.is_empty() {
-        info!(count = abandoned.len(), "cleaned_up_abandoned_sessions");
+    let api = DataApiClient::authenticate(&config.data_api_url, &admission_token, "bot")
+        .await
+        .expect("Failed to authenticate with Data API");
+
+    info!("data_api_authenticated");
+
+    let state = Arc::new(AppState::new(config, api));
+
+    // Spawn heartbeat task — keeps the service session alive
+    {
+        let state_hb = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if let Err(e) = state_hb.api.heartbeat().await {
+                    tracing::warn!(error = %e, "heartbeat_failed");
+                }
+            }
+        });
     }
-
-    let state = Arc::new(AppState::new(config, pool));
 
     let intents = GatewayIntents::non_privileged()
         | GatewayIntents::GUILD_VOICE_STATES

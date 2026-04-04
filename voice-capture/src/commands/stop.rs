@@ -3,7 +3,6 @@
 use serenity::all::*;
 use tracing::{error, info};
 
-use crate::db;
 use crate::session::{Phase, Session};
 use crate::state::AppState;
 
@@ -29,7 +28,7 @@ async fn cleanup_session_ui(ctx: &Context, session: &Session) {
     }
 }
 
-/// Flush remaining audio buffers to S3 and upload metadata.
+/// Flush remaining audio buffers and upload metadata via the Data API.
 /// Transitions the session through Finalizing -> uploading metadata.
 /// Shared by both /stop and auto-stop.
 #[tracing::instrument(skip_all, fields(guild_id = guild_id))]
@@ -46,17 +45,15 @@ async fn finalize_session(
         }
     }
 
-    // Upload meta.json and consent.json to S3 (read-only lock on session data)
-    let (meta_json, consent_json, session_id, s3_prefix_base, participant_count) = {
+    // Upload meta.json and consent.json via Data API (read-only lock on session data)
+    let (meta_json, consent_json, session_id, participant_count) = {
         let sessions = state.sessions.lock().await;
         match sessions.get(guild_id) {
             Some(session) => {
-                let s3_base = format!("sessions/{}/{}", guild_id, session.id);
                 (
                     session.meta_json(),
                     session.consent_json(),
                     session.id.clone(),
-                    s3_base,
                     session.participants.len() as i32,
                 )
             }
@@ -64,41 +61,35 @@ async fn finalize_session(
         }
     };
 
-    let meta_key = format!("{}/meta.json", s3_prefix_base);
-    let consent_key = format!("{}/consent.json", s3_prefix_base);
+    // Parse metadata bytes into JSON values for the API
+    let meta_value: Option<serde_json::Value> =
+        serde_json::from_slice(&meta_json).ok();
+    let consent_value: Option<serde_json::Value> =
+        serde_json::from_slice(&consent_json).ok();
 
-    match state.s3.upload_bytes(&meta_key, meta_json).await {
-        Ok(_) => {
-            metrics::counter!("ttrpg_s3_uploads_total", "type" => "meta", "outcome" => "success").increment(1);
-        }
-        Err(e) => {
-            error!(error = %e, "meta_upload_failed");
-            metrics::counter!("ttrpg_s3_uploads_total", "type" => "meta", "outcome" => "failure").increment(1);
-        }
-    }
-    match state.s3.upload_bytes(&consent_key, consent_json).await {
-        Ok(_) => {
-            metrics::counter!("ttrpg_s3_uploads_total", "type" => "consent", "outcome" => "success").increment(1);
-        }
-        Err(e) => {
-            error!(error = %e, "consent_upload_failed");
-            metrics::counter!("ttrpg_s3_uploads_total", "type" => "consent", "outcome" => "failure").increment(1);
+    if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
+        match state.api.write_metadata(sid, meta_value, consent_value).await {
+            Ok(_) => {
+                metrics::counter!("ttrpg_uploads_total", "type" => "metadata", "outcome" => "success").increment(1);
+            }
+            Err(e) => {
+                error!(error = %e, "metadata_upload_failed");
+                metrics::counter!("ttrpg_uploads_total", "type" => "metadata", "outcome" => "failure").increment(1);
+            }
         }
     }
 
     metrics::gauge!("ttrpg_sessions_active").decrement(1.0);
     info!(session_id = %session_id, "session_finalized");
 
-    // Finalize session in Postgres
+    // Finalize session in Data API
     if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
-        let finalized = db::FinalizedSession {
-            session_id: sid,
-            ended_at: chrono::Utc::now(),
-            participant_count,
-            s3_prefix: Some(s3_prefix_base),
-        };
-        if let Err(e) = db::finalize_session(&state.db, &finalized).await {
-            error!("DB write failed (finalize_session): {e}");
+        if let Err(e) = state
+            .api
+            .finalize_session(sid, chrono::Utc::now(), participant_count)
+            .await
+        {
+            error!("API call failed (finalize_session): {e}");
         }
     }
 
@@ -193,7 +184,7 @@ pub async fn handle_stop(
         }
     }
 
-    // Flush audio buffers to S3, upload metadata, update Postgres, remove session
+    // Flush audio buffers, upload metadata, update Data API, remove session
     finalize_session(ctx, state, guild_id.get()).await;
 
     command

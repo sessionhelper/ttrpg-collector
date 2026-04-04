@@ -10,21 +10,13 @@ pub struct Config {
     #[arg(long, env = "DISCORD_TOKEN")]
     pub token: String,
 
-    /// S3-compatible endpoint URL
-    #[arg(long, env = "S3_ENDPOINT")]
-    pub s3_endpoint: String,
+    /// Data API base URL
+    #[arg(long, env = "DATA_API_URL", default_value = "http://127.0.0.1:8001")]
+    pub data_api_url: String,
 
-    /// S3 access key
-    #[arg(long, env = "S3_ACCESS_KEY")]
-    pub s3_access_key: String,
-
-    /// S3 secret key
-    #[arg(long, env = "S3_SECRET_KEY")]
-    pub s3_secret_key: String,
-
-    /// S3 bucket name
-    #[arg(long, env = "S3_BUCKET", default_value = "ttrpg-dataset-raw")]
-    pub s3_bucket: String,
+    /// Path to admission token file for Data API auth
+    #[arg(long, env = "DATA_API_ADMISSION_PATH", default_value = "/var/run/ovp/admission-token")]
+    pub data_api_admission_path: String,
 
     /// Local buffer directory
     #[arg(long, env = "LOCAL_BUFFER_DIR", default_value = "./sessions")]
@@ -37,12 +29,4 @@ pub struct Config {
     /// Require all participants to consent
     #[arg(long, env = "REQUIRE_ALL_CONSENT", default_value = "true")]
     pub require_all_consent: bool,
-
-    /// S3 chunk size in bytes before flushing (default 5MB)
-    #[arg(long, env = "S3_CHUNK_SIZE", default_value = "5242880")]
-    pub s3_chunk_size: usize,
-
-    /// Postgres database URL
-    #[arg(long, env = "DATABASE_URL")]
-    pub database_url: String,
 }

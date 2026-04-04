@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 
 use serenity::all::{CreateEmbed, CreateButton, ButtonStyle, CreateActionRow};
 
+use crate::api_client::DataApiClient;
 use crate::voice::{AudioHandle, AudioPacket, AudioReceiver};
-use crate::storage::S3Uploader;
 use crate::storage::pseudonymize;
 use crate::storage::bundle::{
     SessionMeta, AudioFormat, ParticipantMeta, ConsentRecord, ConsentEntry,
@@ -79,7 +79,6 @@ pub struct Session {
 
     // Audio config
     pub audio_received: Arc<std::sync::atomic::AtomicBool>,
-    pub s3_prefix: String,
 }
 
 impl Session {
@@ -93,7 +92,6 @@ impl Session {
         require_all: bool,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let s3_prefix = format!("sessions/{}/{}/audio", guild_id, id);
         Self {
             id,
             guild_id,
@@ -110,7 +108,6 @@ impl Session {
             license_followups: Vec::new(),
             license_cleanup_tasks: Vec::new(),
             audio_received: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            s3_prefix,
         }
     }
 
@@ -170,7 +167,7 @@ impl Session {
     pub fn start_recording(
         &mut self,
         call: &mut songbird::Call,
-        s3: Arc<S3Uploader>,
+        api: Arc<DataApiClient>,
     ) -> mpsc::Sender<AudioPacket> {
         let consented_set: HashSet<u64> = self.consented_user_ids()
             .into_iter()
@@ -178,9 +175,13 @@ impl Session {
             .collect();
         let consented_users = Arc::new(Mutex::new(consented_set));
 
+        // Parse session UUID for the API client
+        let session_uuid = uuid::Uuid::parse_str(&self.id)
+            .expect("session id is always a valid UUID");
+
         // Create pipeline once — single buffer task for the session
         let (audio_tx, audio_handle) = AudioReceiver::create_pipeline(
-            s3, self.s3_prefix.clone(),
+            api, session_uuid,
         );
 
         // Attach to the Songbird Call
