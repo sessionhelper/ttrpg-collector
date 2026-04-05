@@ -45,6 +45,22 @@ pub struct Config {
     /// would break the consent contract with real users.
     #[arg(long, env = "BYPASS_CONSENT_USER_IDS", default_value = "")]
     pub bypass_consent_user_ids_raw: String,
+
+    /// If set to true, spawn the loopback E2E harness HTTP server
+    /// (`POST /record`, `POST /stop`, `GET /health`) that lets an external
+    /// test runner drive the collector without a Discord client. **Dev
+    /// only.** Prod leaves this false and the axum task is never spawned.
+    ///
+    /// Paired with `HARNESS_PORT` (default 8010) and should be bound to
+    /// `127.0.0.1` on the host via the compose port mapping —
+    /// `127.0.0.1:8010:8010` — never exposed publicly.
+    #[arg(long, env = "HARNESS_ENABLED", default_value_t = false)]
+    pub harness_enabled: bool,
+
+    /// TCP port for the E2E harness HTTP server, inside the container.
+    /// Only relevant when `harness_enabled` is true.
+    #[arg(long, env = "HARNESS_PORT", default_value_t = 8010)]
+    pub harness_port: u16,
 }
 
 impl Config {
@@ -77,6 +93,8 @@ mod tests {
             min_participants: 1,
             require_all_consent: true,
             bypass_consent_user_ids_raw: raw.into(),
+            harness_enabled: false,
+            harness_port: 8010,
         }
     }
 

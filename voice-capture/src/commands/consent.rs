@@ -287,6 +287,115 @@ async fn add_mid_session_consent(state: &AppState, guild_id: u64, user_id: UserI
 // Startup pipeline: voice join → DAVE wait → transition to Recording
 // ---------------------------------------------------------------------------
 
+/// Outcome of the headless recording startup path, used by the E2E harness.
+///
+/// Mirrors the set of terminal states that `start_recording_pipeline`
+/// handles internally, but surfaces them to the caller so the harness
+/// endpoint can return meaningful HTTP statuses instead of swallowing the
+/// failure.
+#[derive(Debug)]
+pub(crate) enum HeadlessStartOutcome {
+    /// Recording is live.
+    Recording,
+    /// The pipeline was cancelled mid-startup (e.g. by a concurrent /stop).
+    Preempted,
+    /// DAVE never delivered audio after MAX_ATTEMPTS retries.
+    DaveFailed,
+    /// A mid-loop voice rejoin itself failed.
+    DaveRejoinFailed,
+    /// The initial voice-join call errored (serenity/songbird).
+    VoiceJoinFailed(String),
+}
+
+/// Headless variant of `start_recording_pipeline` for the dev-only E2E
+/// harness endpoint in `crate::harness`.
+///
+/// Mirrors the slash-command path's voice-join → DAVE-wait → transition-to-
+/// recording sequence but strips the four `component.channel_id.say()`
+/// user-facing messages and the license followup (there's no human in the
+/// channel for the harness to address). Returns a `HeadlessStartOutcome`
+/// so the caller can translate it into an HTTP response.
+pub(crate) async fn start_recording_headless(
+    ctx: &Context,
+    state: &AppState,
+    guild_id: u64,
+    guild_id_obj: GuildId,
+    session_id: String,
+    channel_id: ChannelId,
+) -> HeadlessStartOutcome {
+    info!("quorum_met — joining voice channel (headless)");
+    let manager = songbird::get(ctx).await.unwrap();
+
+    let _call = match join_voice_and_begin_startup(
+        state,
+        &manager,
+        guild_id,
+        guild_id_obj,
+        channel_id,
+        &session_id,
+    )
+    .await
+    {
+        StartupStep::Proceed(call) => call,
+        StartupStep::Aborted => return HeadlessStartOutcome::Preempted,
+        StartupStep::VoiceJoinFailed(e) => {
+            error!(error = %e, "voice_join_failed (headless)");
+            metrics::counter!("ttrpg_sessions_total", "outcome" => "failed").increment(1);
+            let mut sessions = state.sessions.lock().await;
+            sessions.remove(guild_id);
+            return HeadlessStartOutcome::VoiceJoinFailed(e.to_string());
+        }
+    };
+
+    info!(session_id = %session_id, "registering_audio_receiver (headless)");
+
+    match wait_for_dave(
+        state,
+        &manager,
+        guild_id,
+        guild_id_obj,
+        channel_id,
+        &session_id,
+    )
+    .await
+    {
+        DaveOutcome::Confirmed => {}
+        DaveOutcome::Preempted => {
+            let _ = manager.leave(guild_id_obj).await;
+            return HeadlessStartOutcome::Preempted;
+        }
+        DaveOutcome::Failed => {
+            cancel_and_abandon(state, guild_id, &session_id).await;
+            let _ = manager.leave(guild_id_obj).await;
+            return HeadlessStartOutcome::DaveFailed;
+        }
+        DaveOutcome::RejoinFailed => {
+            cancel_and_abandon(state, guild_id, &session_id).await;
+            return HeadlessStartOutcome::DaveRejoinFailed;
+        }
+    }
+
+    if pipeline_aborted(state, guild_id, &session_id).await {
+        info!("startup_preempted_after_dave_confirm — leaving voice (headless)");
+        let _ = manager.leave(guild_id_obj).await;
+        return HeadlessStartOutcome::Preempted;
+    }
+    transition_to_recording(state, guild_id, &session_id).await;
+
+    play_start_announcement(&manager, guild_id_obj).await;
+    // NB: no embed update, no license followup — there's no consent
+    // message in the harness path and no human to send a followup to.
+    if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
+        && let Err(e) = state.api.update_session_state(sid, "recording").await
+    {
+        error!("API call failed (update_session_state, headless): {e}");
+    }
+
+    metrics::gauge!("ttrpg_sessions_active").increment(1.0);
+    info!(session_id = %session_id, "recording_started (headless)");
+    HeadlessStartOutcome::Recording
+}
+
 /// Top-level orchestrator for the full recording startup sequence. Runs
 /// after quorum is met and the consent interaction has been ack'd.
 async fn start_recording_pipeline(
