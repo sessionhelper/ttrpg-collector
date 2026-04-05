@@ -203,17 +203,29 @@ impl VoiceEventHandler for AudioReceiver {
             let ssrc_map = self.ssrc_to_user.lock().expect("ssrc_map poisoned");
 
             for (ssrc, data) in speaking {
-                // Only capture audio for consented users
+                // Signal DAVE is working as soon as we see ANY decoded
+                // audio — regardless of whether the SSRC is mapped to a
+                // known user. DAVE confirmation and SSRC→user resolution
+                // are independent subsystems; coupling them caused
+                // wait_for_dave to fail in bot-only channels where
+                // SpeakingStateUpdate (OP5) never fires to populate the
+                // ssrc_map. See v0.5.7 commit message for the full
+                // investigation.
+                if data.decoded_voice.is_some() {
+                    self.audio_received
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // Only capture (buffer + upload) audio for consented users
+                // whose SSRC has been resolved to a Discord user ID via
+                // SpeakingStateUpdate. Unmapped SSRCs are silently skipped
+                // — their audio is "seen" by DAVE but not persisted.
                 let user_id = match ssrc_map.get(ssrc) {
                     Some(uid) if consented.contains(uid) => *uid,
                     _ => continue,
                 };
 
                 if let Some(decoded) = &data.decoded_voice {
-                    // Signal DAVE is working
-                    self.audio_received
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-
                     metrics::counter!("ttrpg_audio_packets_received").increment(1);
 
                     // Send to buffer task via channel — no lock contention
