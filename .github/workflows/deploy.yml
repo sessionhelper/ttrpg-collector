@@ -33,8 +33,16 @@ jobs:
           context: .
           tags: |
             ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:dev
             ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
 
+      # Deploy to the OVP compose stack on the production VPS. The stack
+      # lives at /opt/ovp/ and is supervised by systemd via
+      # ovp-data-api.service (which despite the name brings up the whole
+      # compose stack — postgres, data-api, collector). Pulling the new
+      # collector image and restarting the service is enough; the
+      # systemd unit's ExecStart runs `docker compose up -d` which
+      # re-creates any containers whose images changed.
       - name: Deploy to VPS
         uses: appleboy/ssh-action@v1
         with:
@@ -44,9 +52,9 @@ jobs:
           envs: GHCR_TOKEN
           script: |
             echo "$GHCR_TOKEN" | docker login ghcr.io -u sessionhelper --password-stdin
-            cd /opt/ttrpg-collector
-            docker compose pull
-            docker compose up -d
+            cd /opt/ovp
+            docker compose pull collector
+            systemctl restart ovp-data-api
             docker image prune -f
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}

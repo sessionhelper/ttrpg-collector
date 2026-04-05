@@ -23,3 +23,6 @@ jobs:
       - name: Clippy
         working-directory: voice-capture
         run: cargo clippy --release -- -D warnings
+      - name: Test
+        working-directory: voice-capture
+        run: cargo test --release
