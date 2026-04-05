@@ -4,7 +4,7 @@
 //! enforced via enum variants. No more scattered HashMaps in AppState.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -53,7 +53,7 @@ pub enum Phase {
     Recording {
         audio_tx: mpsc::Sender<AudioPacket>,
         audio_handle: AudioHandle,
-        ssrc_map: Arc<Mutex<HashMap<u32, u64>>>,
+        ssrc_map: Arc<StdMutex<HashMap<u32, u64>>>,
         consented_users: Arc<Mutex<HashSet<u64>>>,
     },
 
@@ -239,9 +239,9 @@ impl Session {
     }
 
     /// Check if any SSRC has been mapped (DAVE connection alive, even if silent).
-    pub async fn has_ssrc(&self) -> bool {
+    pub fn has_ssrc(&self) -> bool {
         if let Phase::Recording { ssrc_map, .. } = &self.phase {
-            let map = ssrc_map.lock().await;
+            let map = ssrc_map.lock().expect("ssrc_map poisoned");
             !map.is_empty()
         } else {
             false

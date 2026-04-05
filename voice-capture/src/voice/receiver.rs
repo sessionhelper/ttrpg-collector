@@ -5,7 +5,7 @@
 //! per-speaker PCM data and uploads chunks via the Data API when they reach the threshold.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serenity::async_trait;
 use songbird::events::context_data::VoiceTick;
@@ -111,7 +111,10 @@ impl AudioHandle {
 pub struct AudioReceiver {
     /// Channel sender — VoiceTick pushes audio here, no buffer lock needed
     tx: mpsc::Sender<AudioPacket>,
-    ssrc_to_user: Arc<Mutex<HashMap<u32, u64>>>,
+    /// SSRC → discord user id mapping. std::sync::Mutex because holds are
+    /// always non-blocking (single HashMap op) and the VoiceTick hot path
+    /// should not be awaiting.
+    ssrc_to_user: Arc<StdMutex<HashMap<u32, u64>>>,
     consented_users: Arc<Mutex<HashSet<u64>>>,
     /// Shared flag: set to true once decoded audio arrives (DAVE watchdog)
     pub audio_received: Arc<std::sync::atomic::AtomicBool>,
@@ -146,8 +149,8 @@ impl AudioReceiver {
         tx: mpsc::Sender<AudioPacket>,
         consented_users: Arc<Mutex<HashSet<u64>>>,
         audio_received: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Arc<Mutex<HashMap<u32, u64>>> {
-        let ssrc_map = Arc::new(Mutex::new(HashMap::new()));
+    ) -> Arc<StdMutex<HashMap<u32, u64>>> {
+        let ssrc_map = Arc::new(StdMutex::new(HashMap::new()));
 
         let receiver = Self {
             tx,
@@ -170,8 +173,10 @@ impl AudioReceiver {
 impl VoiceEventHandler for AudioReceiver {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(VoiceTick { speaking, .. }) = ctx {
-            let ssrc_map = self.ssrc_to_user.lock().await;
+            // Acquire the tokio mutex (async) first so the std mutex guard
+            // never needs to cross an await point — std MutexGuard is !Send.
             let consented = self.consented_users.lock().await;
+            let ssrc_map = self.ssrc_to_user.lock().expect("ssrc_map poisoned");
 
             for (ssrc, data) in speaking {
                 // Only capture audio for consented users
@@ -318,7 +323,7 @@ fn process_packet(
 
 /// Tracks SSRC → user_id mappings from Discord speaking events.
 struct SpeakingTracker {
-    ssrc_to_user: Arc<Mutex<HashMap<u32, u64>>>,
+    ssrc_to_user: Arc<StdMutex<HashMap<u32, u64>>>,
 }
 
 #[async_trait]
@@ -327,7 +332,7 @@ impl VoiceEventHandler for SpeakingTracker {
         if let EventContext::SpeakingStateUpdate(speaking) = ctx
             && let Some(uid) = speaking.user_id
         {
-            let mut map = self.ssrc_to_user.lock().await;
+            let mut map = self.ssrc_to_user.lock().expect("ssrc_map poisoned");
             if !map.contains_key(&speaking.ssrc) {
                 info!(ssrc = speaking.ssrc, user_id = %uid, "ssrc_mapped");
             }

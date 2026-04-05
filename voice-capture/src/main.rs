@@ -493,7 +493,7 @@ async fn handle_consent_button(
                     let has_ssrc = {
                         let sessions = state.sessions.lock().await;
                         match sessions.get(guild_id) {
-                            Some(s) if s.id == expected_id => s.has_ssrc().await,
+                            Some(s) if s.id == expected_id => s.has_ssrc(),
                             _ => {
                                 info!("session_replaced_during_ssrc_check");
                                 drop(sessions);
