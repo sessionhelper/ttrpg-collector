@@ -7,6 +7,11 @@ edition = "2024"
 name = "ttrpg-collector"
 path = "src/main.rs"
 
+[[bin]]
+name = "feeder-bot"
+path = "src/bin/feeder_bot.rs"
+required-features = ["e2e-harness"]
+
 [dependencies]
 # Discord
 serenity = { version = "0.12", default-features = false, features = [
@@ -43,6 +48,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", optional = true }
 
+# E2E test harness — only compiled when the `e2e-harness` feature is on.
+# The feeder-bot binary uses axum to expose a tiny local control API so an
+# external test runner can drive join/play/stop/leave during E2E runs.
+axum = { version = "0.7", optional = true }
+
 # TLS
 rustls = { version = "0.23", features = ["ring"] }
 
@@ -54,6 +64,9 @@ bytemuck = "1"
 
 [features]
 prometheus = ["dep:metrics-exporter-prometheus"]
+# E2E harness: builds the feeder-bot binary and any other dev-only harness
+# code. NEVER enable in prod builds of the collector.
+e2e-harness = ["dep:axum"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
