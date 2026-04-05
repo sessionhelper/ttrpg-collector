@@ -3,7 +3,7 @@
 use serenity::all::*;
 use tracing::error;
 
-use crate::session::{consent_buttons, Session};
+use crate::session::{consent_buttons, ConsentScope, Session};
 use crate::state::AppState;
 
 /// Handle the /record slash command.
@@ -193,6 +193,72 @@ pub async fn handle_record(
                 }
                 Err(e) => {
                     error!("API call failed (add_participants_batch): {e}");
+                }
+            }
+
+            // --- E2E harness bypass ----------------------------------------
+            //
+            // If BYPASS_CONSENT_USER_IDS is non-empty, any listed Discord
+            // user in this session is marked as consented (ConsentScope::Full)
+            // locally and remotely WITHOUT a button click. Dev/harness only;
+            // the prod env file leaves this empty so the normal consent flow
+            // is untouched.
+            //
+            // The human user still needs to click Accept for themselves —
+            // this path is only for bot/harness participants that can't click
+            // buttons. When the human consents, the existing quorum check
+            // sees the bypass users as already-accepted and includes them in
+            // the recording just like manually-consented participants.
+            //
+            // Mid-session joiner bypass is NOT handled here (add_participant
+            // fires from voice/events.rs for joiners). Not needed for the
+            // current harness design where all feeders join the channel
+            // before /record fires. See voice/events.rs TODO if that changes.
+            let bypass = state.config.bypass_consent_user_ids();
+            if !bypass.is_empty() {
+                // Snapshot (user_id, participant_uuid) for bypass-eligible
+                // users before we release the lock for the remote calls.
+                let to_bypass: Vec<(UserId, uuid::Uuid)> = {
+                    let sessions = state.sessions.lock().await;
+                    match sessions.get(guild_id.get()) {
+                        Some(s) => accepted
+                            .iter()
+                            .filter(|(_, raw)| bypass.contains(raw))
+                            .filter_map(|(uid, _)| s.participant_uuid(*uid).map(|pid| (*uid, pid)))
+                            .collect(),
+                        None => Vec::new(),
+                    }
+                };
+
+                if !to_bypass.is_empty() {
+                    // Local state transition first — cheap, held briefly.
+                    {
+                        let mut sessions = state.sessions.lock().await;
+                        if let Some(s) = sessions.get_mut(guild_id.get()) {
+                            for (uid, _) in &to_bypass {
+                                s.record_consent(*uid, ConsentScope::Full);
+                            }
+                        }
+                    }
+
+                    // Remote state — each PATCH is independent; any single
+                    // failure is logged but non-fatal so one flaky participant
+                    // doesn't block the rest of the session.
+                    for (uid, pid) in &to_bypass {
+                        if let Err(e) = state.api.record_consent_by_id(*pid, "full").await {
+                            error!(
+                                user_id = %uid,
+                                participant_id = %pid,
+                                error = %e,
+                                "API call failed (record_consent_by_id bypass)",
+                            );
+                        }
+                    }
+
+                    tracing::info!(
+                        bypassed = to_bypass.len(),
+                        "bypass_consent_applied",
+                    );
                 }
             }
         }

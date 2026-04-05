@@ -1,5 +1,7 @@
 //! CLI / environment variable configuration via clap.
 
+use std::collections::HashSet;
+
 use clap::Parser;
 
 /// Bot configuration, populated from CLI args or environment variables.
@@ -31,4 +33,80 @@ pub struct Config {
     /// Require all participants to consent
     #[arg(long, env = "REQUIRE_ALL_CONSENT", default_value = "true")]
     pub require_all_consent: bool,
+
+    /// Comma-separated Discord user IDs that auto-consent at session start
+    /// without clicking the consent button. **Dev/E2E harness only.** The
+    /// prod deployment leaves this empty and the collector therefore never
+    /// bypasses consent.
+    ///
+    /// This exists so the feeder-bot fleet in `ttrpg-collector-feeder` can
+    /// be recorded during E2E runs — those bots can't click Discord buttons
+    /// on their own. Setting this list to non-empty on a prod deployment
+    /// would break the consent contract with real users.
+    #[arg(long, env = "BYPASS_CONSENT_USER_IDS", default_value = "")]
+    pub bypass_consent_user_ids_raw: String,
+}
+
+impl Config {
+    /// Parse `bypass_consent_user_ids_raw` into a deduplicated set of Discord
+    /// user IDs. Empty string → empty set → bypass disabled (the prod default).
+    ///
+    /// Entries that fail to parse as `u64` are silently dropped — a malformed
+    /// env var should not crash the bot, but the ignored value is never
+    /// treated as "valid bypass id 0" either.
+    pub fn bypass_consent_user_ids(&self) -> HashSet<u64> {
+        self.bypass_consent_user_ids_raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(raw: &str) -> Config {
+        Config {
+            token: "t".into(),
+            data_api_url: "u".into(),
+            data_api_shared_secret: "s".into(),
+            local_buffer_dir: "b".into(),
+            min_participants: 1,
+            require_all_consent: true,
+            bypass_consent_user_ids_raw: raw.into(),
+        }
+    }
+
+    #[test]
+    fn bypass_empty_string_yields_empty_set() {
+        assert!(cfg("").bypass_consent_user_ids().is_empty());
+    }
+
+    #[test]
+    fn bypass_single_id_parses() {
+        let s = cfg("1490405412917215463").bypass_consent_user_ids();
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(&1490405412917215463u64));
+    }
+
+    #[test]
+    fn bypass_multiple_ids_with_whitespace() {
+        let s = cfg(" 1, 2 ,3 ").bypass_consent_user_ids();
+        assert_eq!(s, [1u64, 2, 3].into_iter().collect::<HashSet<u64>>());
+    }
+
+    #[test]
+    fn bypass_ignores_garbage_entries() {
+        let s = cfg("1,notanumber,3").bypass_consent_user_ids();
+        assert_eq!(s, [1u64, 3].into_iter().collect::<HashSet<u64>>());
+    }
+
+    #[test]
+    fn bypass_dedups_duplicates() {
+        let s = cfg("1,1,2,1").bypass_consent_user_ids();
+        assert_eq!(s.len(), 2);
+    }
 }

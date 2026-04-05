@@ -70,6 +70,17 @@ cargo run --release
 
 Build deps: `cmake` (for Opus). No `ffmpeg` needed.
 
+## E2E test harness (dev only)
+
+The end-to-end harness feeder bot lives in its own sibling repo,
+[`ttrpg-collector-feeder`](https://github.com/sessionhelper/ttrpg-collector-feeder).
+It's a minimal Discord bot that joins a voice channel and plays a
+pre-recorded WAV on demand via a loopback HTTP control API. Prod builds of
+`ttrpg-collector` never include any harness code.
+
+See `infra/dev-compose.yml` in `sessionhelper-hub` for the four feeder
+services (moe, larry, curly, gygax).
+
 ## CI/CD
 
 GitHub Actions → Docker build → GHCR → SSH deploy on tag `v*`. See `infra/collector.md` in the hub repo for the full deploy pipeline.

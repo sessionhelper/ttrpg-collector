@@ -1,6 +1,6 @@
 FROM rust:1.94-bookworm AS builder
 
-RUN apt-get update && apt-get install -y cmake
+RUN apt-get update && apt-get install -y cmake && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY voice-capture/Cargo.toml voice-capture/Cargo.lock ./
