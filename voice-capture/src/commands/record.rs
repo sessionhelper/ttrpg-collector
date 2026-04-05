@@ -179,12 +179,17 @@ pub async fn handle_record(
                 .collect();
             match state.api.add_participants_batch(sid, &batch_input).await {
                 Ok(rows) => {
+                    let count = rows.len();
                     let mut sessions = state.sessions.lock().await;
                     if let Some(s) = sessions.get_mut(guild_id.get()) {
                         for ((user_id, _), row) in accepted.iter().zip(rows.iter()) {
                             s.set_participant_uuid(*user_id, row.id);
                         }
                     }
+                    tracing::info!(
+                        participants = count,
+                        "participants_batched_and_cached",
+                    );
                 }
                 Err(e) => {
                     error!("API call failed (add_participants_batch): {e}");
