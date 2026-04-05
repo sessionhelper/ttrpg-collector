@@ -42,6 +42,12 @@ pub struct ParticipantConsent {
     pub scope: Option<ConsentScope>,
     pub consented_at: Option<DateTime<Utc>>,
     pub mid_session_join: bool,
+    /// Cached Data API participant row UUID, populated at add_participant
+    /// time from the server's response. When present, consent / license
+    /// click handlers can call the _by_id fast path (1 HTTP round trip)
+    /// instead of the 3-hop find_participant fallback
+    /// (upsert user + list participants + filter by user_id).
+    pub participant_uuid: Option<uuid::Uuid>,
 }
 
 /// Fields owned by both `StartingRecording` and `Recording` phases. The audio
@@ -207,6 +213,7 @@ impl Session {
             scope: None,
             consented_at: None,
             mid_session_join: mid_session,
+            participant_uuid: None,
         });
     }
 
@@ -216,6 +223,26 @@ impl Session {
             p.scope = Some(scope);
             p.consented_at = Some(Utc::now());
         }
+    }
+
+    /// Cache the Data API's participant row UUID for a local user. Called
+    /// after `add_participants_batch` returns so subsequent consent/license
+    /// clicks can skip the find_participant lookup.
+    ///
+    /// Idempotent: if the user already has a uuid, it's overwritten. If the
+    /// user isn't in the participants map, this is a no-op (mirrors
+    /// record_consent's tolerance for stale clicks).
+    pub fn set_participant_uuid(&mut self, user_id: UserId, participant_uuid: uuid::Uuid) {
+        if let Some(p) = self.participants.get_mut(&user_id) {
+            p.participant_uuid = Some(participant_uuid);
+        }
+    }
+
+    /// Look up the cached Data API participant UUID for a local user.
+    /// Returns None if the user isn't in the participants map OR if the
+    /// cache hasn't been populated yet (e.g. bot restarted mid-session).
+    pub fn participant_uuid(&self, user_id: UserId) -> Option<uuid::Uuid> {
+        self.participants.get(&user_id).and_then(|p| p.participant_uuid)
     }
 
     /// True if every participant has responded (accepted or declined).
@@ -645,6 +672,48 @@ mod tests {
         assert_eq!(s.participants.len(), before);
         // First write wins — subsequent adds don't overwrite.
         assert_eq!(s.participants[&user(1)].display_name, "alice");
+    }
+
+    #[test]
+    fn add_participant_defaults_uuid_to_none() {
+        let s = session_with_three_participants(2, true);
+        assert_eq!(s.participants[&user(1)].participant_uuid, None);
+    }
+
+    #[test]
+    fn set_participant_uuid_stores_value() {
+        let mut s = session_with_three_participants(2, true);
+        let pid = uuid::Uuid::new_v4();
+        s.set_participant_uuid(user(1), pid);
+        assert_eq!(s.participant_uuid(user(1)), Some(pid));
+    }
+
+    #[test]
+    fn set_participant_uuid_ignores_unknown_user() {
+        let mut s = session_with_three_participants(2, true);
+        s.set_participant_uuid(user(999), uuid::Uuid::new_v4());
+        // Does NOT silently insert a ghost participant row.
+        assert_eq!(s.participants.len(), 3);
+        assert_eq!(s.participant_uuid(user(999)), None);
+    }
+
+    #[test]
+    fn participant_uuid_returns_none_for_unknown() {
+        let s = session_with_three_participants(2, true);
+        assert_eq!(s.participant_uuid(user(42)), None);
+    }
+
+    #[test]
+    fn set_participant_uuid_survives_record_consent() {
+        // Ordering sanity: caching the UUID then recording consent
+        // should leave both fields populated.
+        let mut s = session_with_three_participants(2, true);
+        let pid = uuid::Uuid::new_v4();
+        s.set_participant_uuid(user(1), pid);
+        s.record_consent(user(1), ConsentScope::Full);
+        let p = &s.participants[&user(1)];
+        assert_eq!(p.participant_uuid, Some(pid));
+        assert_eq!(p.scope, Some(ConsentScope::Full));
     }
 
     #[test]
