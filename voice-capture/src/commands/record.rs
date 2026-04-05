@@ -51,14 +51,23 @@ pub async fn handle_record(
         }
     };
 
-    // Gather non-bot members in the voice channel (cache, instant)
+    // Gather recordable members in the voice channel (cache, instant).
+    //
+    // Bot accounts are filtered out by default — we don't want to record
+    // music bots, utility bots, or other non-human actors that happen to
+    // share the channel. The sole exception is the E2E harness bypass list:
+    // Discord user IDs in `BYPASS_CONSENT_USER_IDS` are treated as
+    // recordable even though they're flagged `user.bot = true`, so the
+    // feeder fleet (Moe/Larry/Curly/Gygax) in `ttrpg-collector-feeder` can
+    // participate in test sessions. Prod leaves the bypass list empty.
+    let bypass_ids = state.config.bypass_consent_user_ids();
     let members: Vec<(UserId, String)> = guild
         .voice_states
         .iter()
         .filter(|(_, vs)| vs.channel_id == Some(channel_id))
         .filter_map(|(uid, _)| {
             let member = guild.members.get(uid)?;
-            if member.user.bot {
+            if member.user.bot && !bypass_ids.contains(&uid.get()) {
                 return None;
             }
             Some((*uid, member.display_name().to_string()))
