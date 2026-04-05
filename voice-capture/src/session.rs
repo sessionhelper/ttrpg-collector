@@ -130,8 +130,8 @@ impl Phase {
     }
 
     /// True if this phase means the session is on its way out — no further
-    /// state mutation should happen except the final remove.
-    #[allow(dead_code)] // Symmetric API to is_stoppable; kept for readers
+    /// state mutation should happen except the final remove. Used by
+    /// `pipeline_aborted` to detect concurrent /stop preemption.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Finalizing | Self::Cancelled | Self::Complete)
     }
@@ -686,6 +686,20 @@ mod tests {
         assert!(Phase::Finalizing.is_terminal());
         assert!(Phase::Cancelled.is_terminal());
         assert!(Phase::Complete.is_terminal());
+    }
+
+    #[test]
+    fn phase_awaiting_consent_is_not_terminal() {
+        // Regression test: pipeline_aborted in consent.rs uses is_terminal
+        // to decide whether the startup pipeline should bail. If
+        // AwaitingConsent were mistakenly reported as terminal, the FIRST
+        // abort check — which fires BEFORE begin_startup transitions the
+        // session to StartingRecording — would return true and every
+        // recording would bail immediately after voice_joined. This
+        // actually happened in the initial state-machine rework. Keep
+        // this assertion to lock in the fix.
+        let s = session_with_three_participants(2, true);
+        assert!(!s.phase.is_terminal());
     }
 
     #[test]

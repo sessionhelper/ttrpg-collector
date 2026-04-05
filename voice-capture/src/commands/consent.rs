@@ -700,22 +700,29 @@ async fn handle_quorum_failure(
 
 /// Check if the recording-startup pipeline should abort.
 ///
-/// Returns `true` when the session has dropped out of the
-/// `Phase::StartingRecording` variant for any reason: removed (session
-/// gone), replaced (new session with the same guild id), or transitioned
-/// to `Cancelled` / `Recording` / `Finalizing` / `Complete` by a
-/// concurrent `/stop` or `auto_stop`.
+/// Returns `true` when the session has dropped into a terminal phase
+/// (`Cancelled` / `Finalizing` / `Complete`) OR been removed from the
+/// manager OR replaced by a newer session with the same guild id. Any
+/// non-terminal phase (`AwaitingConsent`, `StartingRecording`,
+/// `Recording`) is "keep going":
 ///
-/// The valid "keep going" state is specifically `StartingRecording`.
-/// Callers after `confirm_recording` should NOT be calling this — once
-/// the transition has happened, `/stop` takes ownership via
-/// `stop_recording`.
+///   - `AwaitingConsent` is expected BEFORE `begin_startup` is called
+///     (i.e. between quorum-met and the voice-join completing). An early
+///     bug checked only for `StartingRecording` and aborted every run
+///     because the first check fired before the transition.
+///   - `StartingRecording` is the primary "in progress" state.
+///   - `Recording` is briefly passed through in the pipeline's tail
+///     (announcement, UI update, license followup) after
+///     `confirm_recording`. The pipeline is allowed to finish those
+///     cosmetic steps even though `/stop` now owns the session.
+///
+/// A concurrent `/stop` transitions `Starting → Cancelled` or
+/// `Recording → Finalizing`, both terminal, which is what this function
+/// detects.
 async fn pipeline_aborted(state: &AppState, guild_id: u64, expected_session_id: &str) -> bool {
     let sessions = state.sessions.lock().await;
     match sessions.get(guild_id) {
-        Some(s) if s.id == expected_session_id => {
-            !matches!(s.phase, Phase::StartingRecording(_))
-        }
+        Some(s) if s.id == expected_session_id => s.phase.is_terminal(),
         _ => true,
     }
 }
