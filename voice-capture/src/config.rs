@@ -22,8 +22,10 @@ pub struct Config {
     #[arg(long, env = "LOCAL_BUFFER_DIR", default_value = "./sessions")]
     pub local_buffer_dir: String,
 
-    /// Minimum participants to start recording
-    #[arg(long, env = "MIN_PARTICIPANTS", default_value = "2")]
+    /// Minimum participants to start recording. Defaults to 1 (solo dev
+    /// testing). Prod deployments that want quorum should set
+    /// MIN_PARTICIPANTS=2 (or higher) in their env file.
+    #[arg(long, env = "MIN_PARTICIPANTS", default_value = "1")]
     pub min_participants: usize,
 
     /// Require all participants to consent
