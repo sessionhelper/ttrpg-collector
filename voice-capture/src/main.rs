@@ -387,6 +387,21 @@ async fn handle_consent_button(
         )
         .await?;
 
+    // Record consent via Data API. This has to happen BEFORE any of the
+    // abort paths below (DAVE fail, /stop preempts startup, voice join
+    // fails) so that the consent_audit_log captures the user's decision
+    // regardless of whether recording actually starts. The API call is
+    // best-effort — log on failure, don't block local UI.
+    if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
+        let scope_str = match scope {
+            ConsentScope::Full => "full",
+            ConsentScope::Decline => "decline",
+        };
+        if let Err(e) = state.api.record_consent(sid, user_id.get(), scope_str).await {
+            tracing::error!("API call failed (record_consent): {e}");
+        }
+    }
+
     // Mid-session joiner accepted — add to consented_users so their audio is captured
     if is_mid_session_accept {
         let sessions = state.sessions.lock().await;
@@ -719,20 +734,6 @@ async fn handle_consent_button(
                     "Recording cancelled — consent requirements not met.",
                 )
                 .await?;
-        }
-    }
-
-    // Record consent via Data API (after voice join, non-critical path)
-    {
-        let session_uuid = uuid::Uuid::parse_str(&session_id).ok();
-        if let Some(sid) = session_uuid {
-            let scope_str = match scope {
-                ConsentScope::Full => "full",
-                ConsentScope::Decline => "decline",
-            };
-            if let Err(e) = state.api.record_consent(sid, user_id.get(), scope_str).await {
-                tracing::error!("API call failed (record_consent): {e}");
-            }
         }
     }
 
