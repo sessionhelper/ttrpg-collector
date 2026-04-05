@@ -92,6 +92,18 @@ pub async fn handle_record(
         return Ok(());
     }
 
+    // All cheap validation passed. Defer the interaction now — everything
+    // below this line does network I/O (Data API writes, blocklist checks,
+    // blocks on participant inserts) and can easily overrun the 3s response
+    // window. Deferring buys us 15 minutes, and we edit the response with
+    // the consent embed when we're ready.
+    command
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
+        )
+        .await?;
+
     // Create the unified session — all state lives here
     let mut session = Session::new(
         guild_id.get(),
@@ -156,26 +168,24 @@ pub async fn handle_record(
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Respond to Discord FIRST — if this fails, don't store the session
+    // Fill in the deferred response with the consent embed. If Discord
+    // rejects this (e.g., interaction expired after a >15min stall),
+    // don't store the session so nothing dangles.
     let response_result = command
-        .create_response(
+        .edit_response(
             &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(mentions)
-                    .embed(embed)
-                    .components(vec![buttons]),
-            ),
+            EditInteractionResponse::new()
+                .content(mentions)
+                .embed(embed)
+                .components(vec![buttons]),
         )
         .await;
 
     match response_result {
-        Ok(_) => {
+        Ok(msg) => {
             metrics::counter!("ttrpg_sessions_total", "outcome" => "started").increment(1);
             // Store the consent message ID so we can clean it up on session end
-            if let Ok(msg) = command.get_response(&ctx.http).await {
-                session.consent_message = Some((msg.channel_id, msg.id));
-            }
+            session.consent_message = Some((msg.channel_id, msg.id));
             // Only store the session after Discord accepted the response
             let mut sessions = state.sessions.lock().await;
             sessions.insert(session);
