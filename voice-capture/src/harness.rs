@@ -107,10 +107,14 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
 /// add_participants_batch → bypass-consent every member), then jumps
 /// straight to the "quorum met" path via `start_recording_headless`.
 ///
-/// Only users in `BYPASS_CONSENT_USER_IDS` are admitted — if the voice
-/// channel contains any human user (bot=false), the harness flow would
-/// stall waiting for their consent, which is exactly the failure mode
-/// we're trying to avoid. So this endpoint hard-fails on human presence.
+/// Admission policy: **only users in `BYPASS_CONSENT_USER_IDS` are
+/// admitted to the session.** Everyone else in the voice channel — humans,
+/// non-bypass bots, visiting music bots, anyone — is silently skipped.
+/// Their audio never lands in S3 because they're not in the session's
+/// `consented_users` set, so the voice receiver filters their packets at
+/// the hot path regardless. This keeps humans safe-by-default even if
+/// they share the channel during a harness run, and it means the harness
+/// can run without requiring the channel to be scrubbed first.
 async fn record(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RecordRequest>,
@@ -124,9 +128,6 @@ async fn record(
     let guild_id_obj = GuildId::new(req.guild_id);
     let channel_id = ChannelId::new(req.channel_id);
 
-    // Enumerate voice channel members from cache. Mirrors the logic in
-    // commands::record::handle_record, but without the "user's voice
-    // channel" lookup (the harness caller tells us which channel).
     let bypass_ids = state.config.bypass_consent_user_ids();
     if bypass_ids.is_empty() {
         return Err(err(
@@ -135,40 +136,29 @@ async fn record(
         ));
     }
 
-    let (members, human_present) = {
+    // Enumerate voice channel members from cache. Admit only bypass-listed
+    // users; everyone else is silently skipped.
+    let members: Vec<(UserId, String)> = {
         let guild = ctx
             .cache
             .guild(guild_id_obj)
             .ok_or_else(|| err(StatusCode::NOT_FOUND, "guild not in cache"))?
             .clone();
 
-        let mut admitted: Vec<(UserId, String)> = Vec::new();
-        let mut human_present = false;
-        for (uid, vs) in guild.voice_states.iter() {
-            if vs.channel_id != Some(channel_id) {
-                continue;
-            }
-            let Some(member) = guild.members.get(uid) else {
-                continue;
-            };
-            if member.user.bot {
-                if bypass_ids.contains(&uid.get()) {
-                    admitted.push((*uid, member.display_name().to_string()));
-                }
-                // non-bypass bots silently skipped (same as prod record flow)
-            } else {
-                human_present = true;
-            }
-        }
-        (admitted, human_present)
+        guild
+            .voice_states
+            .iter()
+            .filter(|(_, vs)| vs.channel_id == Some(channel_id))
+            .filter(|(uid, _)| bypass_ids.contains(&uid.get()))
+            .filter_map(|(uid, _)| {
+                guild
+                    .members
+                    .get(uid)
+                    .map(|m| (*uid, m.display_name().to_string()))
+            })
+            .collect()
     };
 
-    if human_present {
-        return Err(err(
-            StatusCode::CONFLICT,
-            "human user present in voice channel; harness requires bot-only channel",
-        ));
-    }
     if members.is_empty() {
         return Err(err(
             StatusCode::PRECONDITION_FAILED,
