@@ -56,34 +56,46 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        // Spawn every handler into a detached task so the serenity gateway can
+        // keep pumping other interactions while slow work (DAVE retries,
+        // session finalization, S3 uploads) runs in the background. If a
+        // handler blocks inline here, subsequent /stop / button clicks sit
+        // in the gateway queue and their interaction tokens expire before
+        // the handler even calls defer().
         match interaction {
             Interaction::Command(command) => {
-                let result = match command.data.name.as_str() {
-                    "record" => {
-                        commands::record::handle_record(&ctx, &command, &self.state).await
-                    }
-                    "stop" => commands::stop::handle_stop(&ctx, &command, &self.state).await,
-                    _ => Ok(()),
-                };
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    let result = match command.data.name.as_str() {
+                        "record" => {
+                            commands::record::handle_record(&ctx, &command, &state).await
+                        }
+                        "stop" => commands::stop::handle_stop(&ctx, &command, &state).await,
+                        _ => Ok(()),
+                    };
 
-                if let Err(e) = result {
-                    error!(error = %e, "command_error");
-                }
+                    if let Err(e) = result {
+                        error!(error = %e, "command_error");
+                    }
+                });
             }
             Interaction::Component(component) => {
-                if let Err(e) = handle_consent_button(&ctx, &component, &self.state).await {
-                    error!(error = %e, "consent_button_error");
-                    // Clean up stale session on interaction failure — only if still awaiting consent
-                    if let Some(gid) = component.guild_id {
-                        let mut sessions = self.state.sessions.lock().await;
-                        if let Some(session) = sessions.get(gid.get())
-                            && matches!(session.phase, Phase::AwaitingConsent)
-                        {
-                            info!(guild_id = %gid, "cleaning_up_stale_session");
-                            sessions.remove(gid.get());
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_consent_button(&ctx, &component, &state).await {
+                        error!(error = %e, "consent_button_error");
+                        // Clean up stale session on interaction failure — only if still awaiting consent
+                        if let Some(gid) = component.guild_id {
+                            let mut sessions = state.sessions.lock().await;
+                            if let Some(session) = sessions.get(gid.get())
+                                && matches!(session.phase, Phase::AwaitingConsent)
+                            {
+                                info!(guild_id = %gid, "cleaning_up_stale_session");
+                                sessions.remove(gid.get());
+                            }
                         }
                     }
-                }
+                });
             }
             _ => {}
         }
