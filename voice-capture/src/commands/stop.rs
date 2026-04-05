@@ -50,8 +50,14 @@ enum StopAction {
 /// an assumption that was wrong for StartingRecording and AwaitingConsent,
 /// and manifested as: orphan Data API rows, double-decrement of the
 /// sessions_active gauge, and metadata uploads with zero audio.
+///
+/// `pub(crate)` so the dev-only E2E harness endpoint in `crate::harness`
+/// can finalize sessions without a Discord `/stop` interaction. The
+/// `_ctx` parameter is unused today but kept in the signature for future
+/// code paths that need to send Discord messages (e.g. auto-stop
+/// announcements in the voice channel).
 #[tracing::instrument(skip_all, fields(guild_id = guild_id))]
-async fn finalize_session(
+pub(crate) async fn finalize_session(
     _ctx: &Context,
     state: &AppState,
     guild_id: u64,

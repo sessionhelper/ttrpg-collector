@@ -15,6 +15,7 @@
 mod api_client;
 mod commands;
 mod config;
+mod harness;
 mod session;
 mod state;
 mod storage;
@@ -48,6 +49,13 @@ struct Handler {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "bot_ready");
+
+        // Publish the Context into AppState so the dev-only E2E harness
+        // endpoint can access the cache + songbird manager. First caller
+        // wins — subsequent ready events (e.g. after a reconnect) are
+        // ignored because the OnceCell is already populated. That's fine:
+        // the cache inside Context is Arc'd and shared across reconnects.
+        let _ = self.state.ctx.set(ctx.clone());
 
         for guild in &ready.guilds {
             let cmds = vec![
@@ -152,6 +160,12 @@ async fn main() {
     info!("data_api_authenticated");
 
     let state = Arc::new(AppState::new(config, api));
+
+    // Dev-only E2E harness HTTP server. No-op unless HARNESS_ENABLED=true.
+    // Spawned before the serenity client starts so it's ready to serve
+    // /health probes during startup; /record and /stop 503 until the
+    // `ready` event populates AppState.ctx.
+    harness::spawn(state.clone()).await;
 
     // Heartbeat task — keeps the Data API service session alive (reaped
     // server-side after 90 seconds of inactivity).
