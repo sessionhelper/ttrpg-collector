@@ -150,10 +150,16 @@ pub async fn handle_record(
         }
 
         if !create_failed {
+            // Blocklist check per user first. Users who've opted out
+            // globally are dropped from the batch before it's sent.
+            let mut accepted: Vec<(UserId, u64)> = Vec::with_capacity(members.len());
             for (uid, _name) in &members {
                 match state.api.check_blocklist(uid.get()).await {
                     Ok(true) => {
-                        tracing::info!(user_id = %uid, "participant_blocked — user opted out globally, skipping");
+                        tracing::info!(
+                            user_id = %uid,
+                            "participant_blocked — user opted out globally, skipping"
+                        );
                         continue;
                     }
                     Err(e) => {
@@ -161,13 +167,27 @@ pub async fn handle_record(
                     }
                     _ => {}
                 }
+                accepted.push((*uid, uid.get()));
+            }
 
-                if let Err(e) = state
-                    .api
-                    .add_participant(sid, uid.get(), false)
-                    .await
-                {
-                    error!("API call failed (add_participant): {e}");
+            // Single batch insert + single response → one HTTP round trip
+            // regardless of party size. Cache each returned UUID on the
+            // local Session so consent/license clicks hit the fast path.
+            let batch_input: Vec<(u64, bool)> = accepted
+                .iter()
+                .map(|(_, raw)| (*raw, false))
+                .collect();
+            match state.api.add_participants_batch(sid, &batch_input).await {
+                Ok(rows) => {
+                    let mut sessions = state.sessions.lock().await;
+                    if let Some(s) = sessions.get_mut(guild_id.get()) {
+                        for ((user_id, _), row) in accepted.iter().zip(rows.iter()) {
+                            s.set_participant_uuid(*user_id, row.id);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("API call failed (add_participants_batch): {e}");
                 }
             }
         }
