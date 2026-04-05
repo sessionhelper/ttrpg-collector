@@ -1,36 +1,17 @@
 # ttrpg-collector
 
-Discord bot for collecting TTRPG session audio for an open dataset.
+> Org-wide conventions (Rust style, git workflow, shared-secret auth, pseudonymization, cross-service architecture) live in `/home/alex/sessionhelper-hub/CLAUDE.md`. Read that first for anything cross-cutting.
 
-## Code Style
-
-Follow [Rust Design Patterns](https://rust-unofficial.github.io/patterns/) and [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/).
-
-**Readability:**
-- Add comments that explain **why**, not what. Every function should have a brief doc comment explaining its purpose and rationale.
-- Complex logic blocks should have inline comments — especially Discord API quirks, timing constraints, and error handling decisions.
-- Keep comments concise but sufficient for someone reading the code for the first time.
-
-**Patterns:**
-- Use `Result` + `?` for error propagation — keep the happy path flat, no nested if/match chains.
-- Use enums with data for state machines — match on state, don't if-check fields.
-- Use iterators over manual loops. Use `filter`, `map`, `for_each` over index-based iteration.
-- Use the typestate pattern when invalid transitions should be compile errors.
-- Avoid premature abstraction — three similar lines beats a premature generic.
-
-**Anti-patterns (don't do these):**
-- No deeply nested if-statements — flatten with early returns and `?`.
-- No stringly-typed state — use enums.
-- No scattered state across multiple HashMaps — use a struct that owns its data.
-- No manual mutex juggling for hot paths — use channels.
+Discord bot that captures TTRPG session audio with per-participant consent and uploads it through the Data API for the Open Voice Project dataset.
 
 ## Stack
 
-- Rust (serenity + songbird)
-- songbird `next` branch for DAVE E2EE voice receive
-- aws-sdk-s3 for S3-compatible uploads (Hetzner Object Storage)
-- sqlx 0.8 for Postgres
-- No ffmpeg — raw PCM uploaded to S3, pipeline crate handles audio processing
+- `serenity` 0.12 — Discord gateway
+- `songbird` (`next` branch) — voice capture with **DAVE E2EE** support. Required because py-cord's DAVE impl captured only ~10% of packets.
+- `davey` — MLS/AES-256-GCM for DAVE
+- `opus2` — Opus decode
+- `reqwest` — talks to the Data API (never touches S3 or Postgres directly)
+- No `ffmpeg` at runtime — raw PCM goes up, `ovp-pipeline` handles audio processing downstream.
 
 ## Layout
 
@@ -38,65 +19,57 @@ Follow [Rust Design Patterns](https://rust-unofficial.github.io/patterns/) and [
 voice-capture/
   src/
     main.rs              — entry point, serenity client, event handlers
-    config.rs            — env var config (clap)
-    state.rs             — simplified AppState (sessions, s3, db)
-    session.rs           — unified Session struct, Phase enum, consent, metadata serialization
-    telemetry.rs         — metrics descriptions (counters, gauges, histograms)
-    db.rs                — Postgres data access layer
+    config.rs            — clap env config
+    state.rs             — AppState (sessions, api client)
+    session.rs           — Session struct, Phase enum, consent state machine, metadata
+    telemetry.rs         — metrics counters/gauges/histograms
+    api_client.rs        — Data API HTTP client (auth, chunks, sessions, participants)
+    lib.rs               — library entry for tests
     commands/
-      record.rs          — /record slash command
-      stop.rs            — /stop + auto-stop (finalize + S3 upload)
+      record.rs          — /record slash command + consent embed
+      stop.rs            — /stop + auto-stop finalization
     voice/
-      receiver.rs        — channel-based audio pipeline, chunked S3 upload, DAVE detection
+      receiver.rs        — AudioReceiver, SSRC→user mapping, channel-based chunk upload
     storage/
-      bundle.rs          — serialization structs, pseudonymization
-      s3.rs              — S3 upload_bytes with retry
-  assets/
-    recording_started.wav — TTS clip played on recording start
-    recording_stopped.wav — TTS clip played on /stop
-  migrations/
-    001_initial.sql      — users, sessions, participants, audit log
-    002_transcripts.sql  — segments, flags, edits
-  build.rs               — git version string (tag/branch-hash-dirty)
-  Cargo.toml
+      bundle.rs          — SessionMeta + ConsentRecord serde, pseudonymize() helper
+  migrations/            — reference SQL for the Data API schema (not run here)
+  assets/                — TTS clips (recording_started.wav, recording_stopped.wav)
 scripts/
-  sync-s3.sh             — download S3 data locally
+  sync-s3.sh             — local data download for review
 legal/                   — privacy policy, ToS, consent text, dataset card
 ```
 
-## Building
+## Repo-specific decisions
+
+- **Unified `Session` struct with `Phase` enum** (AwaitingConsent / Recording / Finalizing / Complete). No scattered HashMaps.
+- **Channel-based audio pipeline** — `VoiceTick` handler → lock-free mpsc → buffer task → 5MB chunks to Data API. No mutexes on the hot path.
+- **SSRC → user_id mapping** via `SpeakingStateUpdate` events. Only consented users' packets leave the receiver.
+- **Mid-session joiners** get a consent prompt before their audio is captured.
+- **Auto-stop** after 30s empty voice channel.
+- **Songbird `next` branch is pinned** — don't bump to a stable release until DAVE lands there.
+
+## Env vars
+
+| Var | Required | Default |
+|---|---|---|
+| `DISCORD_TOKEN` | yes | — |
+| `DATA_API_URL` | no | `http://127.0.0.1:8001` |
+| `DATA_API_SHARED_SECRET` | yes | — |
+| `LOCAL_BUFFER_DIR` | no | `./sessions` |
+| `MIN_PARTICIPANTS` | no | `2` |
+| `REQUIRE_ALL_CONSENT` | no | `true` |
+
+## Build / run
 
 ```bash
+cp .env.example .env      # fill in credentials
 cd voice-capture
 cargo build --release
-```
-
-Requires: cmake (for opus build), ffmpeg (runtime, for PCM→FLAC)
-
-## Running
-
-```bash
-cp .env.example .env  # fill in credentials
-cd voice-capture
 cargo run --release
 ```
 
-## Git Workflow
+Build deps: `cmake` (for Opus). No `ffmpeg` needed.
 
-- **main** — production. Only receives merges from `dev`. Tag to deploy.
-- **dev** — integration branch. Feature branches merge here first.
-- **feature/*** — branch from `dev`, merge back to `dev` via `--no-ff`
+## CI/CD
 
-**Never commit directly to main or dev. Never merge feature branches directly to main.**
-
-```
-feature/foo → dev (--no-ff) → main (--no-ff) → tag v0.x.x → CI/CD deploy
-```
-
-## Key Decisions
-
-- Full Rust — py-cord's DAVE voice receive was fundamentally broken (~10% packet capture)
-- Songbird handles DAVE/E2EE natively with near-zero packet loss
-- PCM written to disk, converted to FLAC on /stop, uploaded to S3
-- Per-user tracks via SSRC → user_id mapping from SpeakingStateUpdate events
-- Simple SHA256 hash for pseudonymization (no salt — voice is public anyway)
+GitHub Actions → Docker build → GHCR → SSH deploy on tag `v*`. See `infra/collector.md` in the hub repo for the full deploy pipeline.
