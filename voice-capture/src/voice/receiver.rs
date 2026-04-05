@@ -286,9 +286,12 @@ fn process_packet(
         SpeakerBuffer::new(pseudo_id)
     });
 
-    let byte_len = packet.data.len() * 2;
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(packet.data.as_ptr() as *const u8, byte_len) };
+    // Reinterpret the decoded i16 PCM samples as little-endian bytes for
+    // upload. bytemuck::cast_slice is zero-copy and statically checks that
+    // i16→u8 is a sound reinterpretation (alignment + size), so we don't
+    // need unsafe. Host endianness matters: x86/ARM64 are LE, matching the
+    // pcm_s16le format we advertise in meta.json.
+    let bytes: &[u8] = bytemuck::cast_slice(&packet.data);
 
     if let Some(chunk) = buffer.write(bytes) {
         let size = chunk.data.len();
