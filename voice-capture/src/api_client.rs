@@ -477,21 +477,6 @@ impl DataApiClient {
         Ok((updated.no_llm_training, updated.no_public_release))
     }
 
-    /// Get license flags for a participant. Returns (false, false) when the
-    /// participant can't be resolved — this is a "display state" helper
-    /// called from a button click; absence shouldn't be an error.
-    pub async fn get_license_flags(
-        &self,
-        session_id: Uuid,
-        discord_user_id: u64,
-    ) -> Result<(bool, bool), ApiError> {
-        match self.find_participant(session_id, discord_user_id).await {
-            Ok(p) => Ok((p.no_llm_training, p.no_public_release)),
-            Err(ApiError::Status { status: 404, .. }) => Ok((false, false)),
-            Err(e) => Err(e),
-        }
-    }
-
     /// List participants for a session.
     pub async fn list_participants(
         &self,

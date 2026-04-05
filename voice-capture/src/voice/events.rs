@@ -135,7 +135,9 @@ async fn handle_mid_session_join(
         .map(|m| m.display_name().to_string())
         .unwrap_or_else(|| format!("User {user_id}"));
 
-    // Register locally and push to Data API.
+    // Register locally and push to Data API. Cache the returned UUID on
+    // the local Session so the joiner's eventual consent click hits the
+    // fast path instead of find_participant.
     let session_id_str = {
         let mut sessions = state.sessions.lock().await;
         sessions.get_mut(guild_id.get()).map(|session| {
@@ -146,9 +148,16 @@ async fn handle_mid_session_join(
 
     if let Some(sid_str) = &session_id_str
         && let Ok(sid) = uuid::Uuid::parse_str(sid_str)
-        && let Err(e) = state.api.add_participant(sid, user_id.get(), true).await
     {
-        error!("API call failed (add_participant mid-session): {e}");
+        match state.api.add_participant(sid, user_id.get(), true).await {
+            Ok(row) => {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(guild_id.get()) {
+                    s.set_participant_uuid(user_id, row.id);
+                }
+            }
+            Err(e) => error!("API call failed (add_participant mid-session): {e}"),
+        }
     }
 
     info!(user_id = %user_id, name = %display_name, "mid_session_joiner");

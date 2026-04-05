@@ -42,29 +42,63 @@ pub async fn handle_license_button(
         _ => return Ok(()),
     };
 
-    let session_id_str = {
+    // Snapshot session id, cached participant UUID, and current cached
+    // license flags under one lock. All three come from the local Session
+    // — no HTTP roundtrip for a read-back.
+    let (session_id_str, cached_pid, cached_flags) = {
         let sessions = state.sessions.lock().await;
-        sessions.get(guild_id).map(|s| s.id.clone())
+        match sessions.get(guild_id) {
+            Some(s) => (
+                Some(s.id.clone()),
+                s.participant_uuid(user_id),
+                s.license_flags(user_id),
+            ),
+            None => (None, None, (false, false)),
+        }
     };
 
-    // Toggle then read-back: two Data API round-trips. Both phase-aware
-    // inside the client via find_participant.
-    let (no_llm, no_public) = if let Some(sid_str) = &session_id_str {
-        if let Ok(sid) = uuid::Uuid::parse_str(sid_str) {
-            if let Err(e) = state.api.toggle_license_flag(sid, user_id.get(), field).await {
-                error!("API call failed (toggle_license_flag): {e}");
+    // Fast path: cached UUID → single PATCH that returns the new flag
+    // values in the response body. No find_participant, no read-back,
+    // no extra GET. One HTTP round trip per click.
+    //
+    // Cold cache: fall back to the 3-hop toggle (upsert user + list
+    // participants + PATCH). Same as the pre-cache behavior.
+    let (no_llm, no_public) = if let Some(pid) = cached_pid {
+        match state
+            .api
+            .toggle_license_flag_by_id(pid, field, cached_flags.0, cached_flags.1)
+            .await
+        {
+            Ok(new_flags) => new_flags,
+            Err(e) => {
+                error!("API call failed (toggle_license_flag_by_id): {e}");
+                cached_flags
             }
-            state
-                .api
-                .get_license_flags(sid, user_id.get())
-                .await
-                .unwrap_or((false, false))
+        }
+    } else if let Some(sid_str) = &session_id_str {
+        if let Ok(sid) = uuid::Uuid::parse_str(sid_str) {
+            match state.api.toggle_license_flag(sid, user_id.get(), field).await {
+                Ok(new_flags) => new_flags,
+                Err(e) => {
+                    error!("API call failed (toggle_license_flag): {e}");
+                    (false, false)
+                }
+            }
         } else {
             (false, false)
         }
     } else {
         (false, false)
     };
+
+    // Update the local cache so the next click on this button computes
+    // the correct toggle without another round trip.
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(guild_id) {
+            s.set_license_flags(user_id, no_llm, no_public);
+        }
+    }
 
     // Re-render button row — state expressed through button style alone.
     let llm_style = if no_llm { ButtonStyle::Danger } else { ButtonStyle::Secondary };

@@ -48,6 +48,12 @@ pub struct ParticipantConsent {
     /// instead of the 3-hop find_participant fallback
     /// (upsert user + list participants + filter by user_id).
     pub participant_uuid: Option<uuid::Uuid>,
+    /// Local mirror of the Data API license flags, updated from batch-add
+    /// responses and license-toggle PATCH responses. Lets license button
+    /// clicks compute the toggle + patch in a single round trip without
+    /// a read-back.
+    pub no_llm_training: bool,
+    pub no_public_release: bool,
 }
 
 /// Fields owned by both `StartingRecording` and `Recording` phases. The audio
@@ -214,7 +220,34 @@ impl Session {
             consented_at: None,
             mid_session_join: mid_session,
             participant_uuid: None,
+            no_llm_training: false,
+            no_public_release: false,
         });
+    }
+
+    /// Update the cached license flags for a participant from a Data API
+    /// PATCH response. Called after each license toggle so the next toggle
+    /// can be computed locally without a read-back.
+    pub fn set_license_flags(
+        &mut self,
+        user_id: UserId,
+        no_llm_training: bool,
+        no_public_release: bool,
+    ) {
+        if let Some(p) = self.participants.get_mut(&user_id) {
+            p.no_llm_training = no_llm_training;
+            p.no_public_release = no_public_release;
+        }
+    }
+
+    /// Current cached license flags for a participant, or (false, false)
+    /// as the default. Used by the license button click handler to pass
+    /// "current" flags into toggle_license_flag_by_id.
+    pub fn license_flags(&self, user_id: UserId) -> (bool, bool) {
+        self.participants
+            .get(&user_id)
+            .map(|p| (p.no_llm_training, p.no_public_release))
+            .unwrap_or((false, false))
     }
 
     /// Record a participant's consent choice.
@@ -701,6 +734,32 @@ mod tests {
     fn participant_uuid_returns_none_for_unknown() {
         let s = session_with_three_participants(2, true);
         assert_eq!(s.participant_uuid(user(42)), None);
+    }
+
+    #[test]
+    fn license_flags_default_to_false_false() {
+        let s = session_with_three_participants(2, true);
+        assert_eq!(s.license_flags(user(1)), (false, false));
+    }
+
+    #[test]
+    fn set_license_flags_round_trips() {
+        let mut s = session_with_three_participants(2, true);
+        s.set_license_flags(user(1), true, false);
+        assert_eq!(s.license_flags(user(1)), (true, false));
+        s.set_license_flags(user(1), true, true);
+        assert_eq!(s.license_flags(user(1)), (true, true));
+        s.set_license_flags(user(1), false, true);
+        assert_eq!(s.license_flags(user(1)), (false, true));
+    }
+
+    #[test]
+    fn set_license_flags_ignores_unknown_user() {
+        let mut s = session_with_three_participants(2, true);
+        s.set_license_flags(user(999), true, true);
+        // No ghost insertion.
+        assert_eq!(s.participants.len(), 3);
+        assert_eq!(s.license_flags(user(999)), (false, false));
     }
 
     #[test]

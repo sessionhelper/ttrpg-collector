@@ -135,8 +135,10 @@ async fn record_click(
     let user_id = component.user.id;
 
     // Fast path: lock once, validate eligibility, record consent, decide
-    // whether this click triggered quorum.
-    let (should_start, is_mid_session_accept, embed, session_id, channel_id) = {
+    // whether this click triggered quorum. Also snapshot the cached
+    // participant UUID (if any) so the Data API call below can hit the
+    // fast path.
+    let (should_start, is_mid_session_accept, embed, session_id, channel_id, cached_pid) = {
         let mut sessions = state.sessions.lock().await;
         let session = match sessions.get_mut(guild_id) {
             Some(s) => s,
@@ -184,8 +186,16 @@ async fn record_click(
         let is_mid_session_accept = is_mid_session && scope == ConsentScope::Full;
         let session_id = session.id.clone();
         let channel_id = ChannelId::new(session.channel_id);
+        let cached_pid = session.participant_uuid(user_id);
 
-        (should_start, is_mid_session_accept, embed, session_id, channel_id)
+        (
+            should_start,
+            is_mid_session_accept,
+            embed,
+            session_id,
+            channel_id,
+            cached_pid,
+        )
     };
 
     // Ack the interaction IMMEDIATELY — inside Discord's 3-second window.
@@ -205,14 +215,24 @@ async fn record_click(
     // If the pipeline later aborts (DAVE failed, /stop preempts), we still
     // want the consent_audit_log to reflect the user's choice. Best effort
     // — logged on failure, doesn't block the UI.
-    if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
-        let scope_str = match scope {
-            ConsentScope::Full => "full",
-            ConsentScope::Decline => "decline",
-        };
-        if let Err(e) = state.api.record_consent(sid, user_id.get(), scope_str).await {
-            error!("API call failed (record_consent): {e}");
-        }
+    //
+    // Fast path: if we cached the participant UUID when they were added
+    // (the common case, populated by add_participants_batch during
+    // /record), skip the 3-hop find_participant dance. Cold cache — e.g.
+    // bot restart mid-session — falls through to the discord-id lookup.
+    let scope_str = match scope {
+        ConsentScope::Full => "full",
+        ConsentScope::Decline => "decline",
+    };
+    let api_result = if let Some(pid) = cached_pid {
+        state.api.record_consent_by_id(pid, scope_str).await
+    } else if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
+        state.api.record_consent(sid, user_id.get(), scope_str).await
+    } else {
+        Ok(())
+    };
+    if let Err(e) = api_result {
+        error!("API call failed (record_consent): {e}");
     }
 
     // Mid-session joiner accepted — add them to the live capture set so
