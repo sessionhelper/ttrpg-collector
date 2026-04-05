@@ -83,25 +83,14 @@ cargo run --release
 
 ## E2E test harness (dev only)
 
-The `e2e-harness` cargo feature builds an extra binary, `feeder-bot`, used by
-the end-to-end test harness. It's a minimal Discord bot that joins a voice
-channel and plays a WAV on demand via a loopback HTTP control API. Prod
-builds of `ttrpg-collector` never enable this feature and never include any
-harness code.
+The end-to-end harness feeder bot lives in its own sibling repo,
+[`ttrpg-collector-feeder`](https://github.com/sessionhelper/ttrpg-collector-feeder).
+It's a minimal Discord bot that joins a voice channel and plays a
+pre-recorded WAV on demand via a loopback HTTP control API. Prod builds of
+`ttrpg-collector` never include any harness code.
 
-```bash
-# Build just the feeder bot:
-cd voice-capture
-cargo build --release --bin feeder-bot --features e2e-harness
-
-# Regenerate the four feeder voice WAVs (requires `piper` CLI on PATH —
-# install via `uv tool install piper-tts`):
-./assets/generate_voices.sh
-```
-
-See `src/bin/feeder_bot.rs` for the control API (`/health`, `/join`, `/play`,
-`/stop`, `/leave`) and `infra/dev-compose.yml` in `sessionhelper-hub` for the
-four feeder services (moe, larry, curly, gygax).
+See `infra/dev-compose.yml` in `sessionhelper-hub` for the four feeder
+services (moe, larry, curly, gygax).
 
 ## Git Workflow
 
