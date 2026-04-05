@@ -37,6 +37,20 @@ async fn finalize_session(
     state: &AppState,
     guild_id: u64,
 ) {
+    // Signal any in-progress startup pipeline (voice join, DAVE wait,
+    // recording_started follow-ups) to bail out cooperatively. The flag
+    // is on a per-Session Arc so even if we remove the session from the
+    // map below, the pipeline task still sees the cancellation via its
+    // captured clone.
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get(guild_id) {
+            session
+                .startup_cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     // Finalize: shut down audio pipeline, set ended_at
     {
         let mut sessions = state.sessions.lock().await;

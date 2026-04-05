@@ -272,6 +272,29 @@ impl EventHandler for Handler {
     }
 }
 
+/// Check if the recording-startup pipeline should abort. Returns true if
+/// the `cancel` flag has been set (by /stop or auto_stop via finalize_session)
+/// OR if the session has vanished from the manager OR if it's been replaced
+/// by a newer one (different session id). The pipeline captures its cancel
+/// flag and expected session id up-front so the check is stable even if the
+/// session is concurrently removed.
+async fn pipeline_aborted(
+    state: &AppState,
+    guild_id: u64,
+    expected_session_id: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if cancel.load(Ordering::Relaxed) {
+        return true;
+    }
+    let sessions = state.sessions.lock().await;
+    match sessions.get(guild_id) {
+        Some(s) => s.id != expected_session_id,
+        None => true,
+    }
+}
+
 /// Handle consent Accept/Decline button clicks.
 /// Uses one lock on `state.sessions` to read and mutate session state.
 #[tracing::instrument(skip_all, fields(guild_id = component.guild_id.map(|g| g.get()), user_id = %component.user.id))]
@@ -382,17 +405,52 @@ async fn handle_consent_button(
         let guild_id_obj = component.guild_id.unwrap();
         let manager = songbird::get(ctx).await.unwrap();
 
+        // Capture the cancellation flag before we start any long-running
+        // work. This Arc outlives the session itself — if /stop fires and
+        // removes the session from the manager, our captured flag still
+        // carries the cancellation signal and we see it at the next await
+        // point instead of panicking on sessions.get(...).unwrap().
+        let cancel = {
+            let sessions = state.sessions.lock().await;
+            match sessions.get(guild_id) {
+                Some(s) => s.startup_cancelled.clone(),
+                None => {
+                    info!("session_vanished_before_pipeline_start");
+                    return Ok(());
+                }
+            }
+        };
+        let expected_id = session_id.clone();
+
         match manager.join(guild_id_obj, channel_id).await {
             Ok(call) => {
                 info!("voice_joined");
 
-                // Start the audio pipeline via the session state machine
-                let _audio_tx = {
+                // Abort if /stop fired while we were joining voice.
+                if pipeline_aborted(state, guild_id, &expected_id, &cancel).await {
+                    info!("startup_cancelled_after_voice_join — leaving voice");
+                    let _ = manager.leave(guild_id_obj).await;
+                    return Ok(());
+                }
+
+                // Start the audio pipeline via the session state machine.
+                // Phase-guard the mutation so a concurrently-replaced session
+                // doesn't get its pipeline hijacked.
+                {
                     let mut sessions = state.sessions.lock().await;
-                    let session = sessions.get_mut(guild_id).unwrap();
-                    let mut handler = call.lock().await;
-                    session.start_recording(&mut handler, state.api.clone())
-                };
+                    match sessions.get_mut(guild_id) {
+                        Some(s) if s.id == expected_id => {
+                            let mut handler = call.lock().await;
+                            let _audio_tx = s.start_recording(&mut handler, state.api.clone());
+                        }
+                        _ => {
+                            info!("session_replaced_before_start_recording");
+                            drop(sessions);
+                            let _ = manager.leave(guild_id_obj).await;
+                            return Ok(());
+                        }
+                    }
+                }
 
                 info!(session_id = %session_id, "registering_audio_receiver");
 
@@ -405,13 +463,24 @@ async fn handle_consent_button(
                     info!(attempt = attempt, "waiting_for_dave");
                     tokio::time::sleep(std::time::Duration::from_secs(DAVE_WAIT_SECS)).await;
 
-                    // Check session state for DAVE confirmation
-                    let (has_audio, _has_ssrc) = {
+                    if pipeline_aborted(state, guild_id, &expected_id, &cancel).await {
+                        info!("startup_cancelled_during_dave_wait — leaving voice");
+                        let _ = manager.leave(guild_id_obj).await;
+                        return Ok(());
+                    }
+
+                    // Check session state for DAVE confirmation. Phase-guarded.
+                    let has_audio = {
                         let sessions = state.sessions.lock().await;
-                        let session = sessions.get(guild_id).unwrap();
-                        let audio = session.has_audio();
-                        // has_ssrc is async because it locks the ssrc_map inside Phase
-                        (audio, false) // will check ssrc separately
+                        match sessions.get(guild_id) {
+                            Some(s) if s.id == expected_id => s.has_audio(),
+                            _ => {
+                                info!("session_replaced_during_dave_wait");
+                                drop(sessions);
+                                let _ = manager.leave(guild_id_obj).await;
+                                return Ok(());
+                            }
+                        }
                     };
 
                     if has_audio {
@@ -421,11 +490,18 @@ async fn handle_consent_button(
                         break;
                     }
 
-                    // Check SSRC separately (needs .await inside the session)
+                    // Check SSRC separately (needs .await inside the session). Phase-guarded.
                     let has_ssrc = {
                         let sessions = state.sessions.lock().await;
-                        let session = sessions.get(guild_id).unwrap();
-                        session.has_ssrc().await
+                        match sessions.get(guild_id) {
+                            Some(s) if s.id == expected_id => s.has_ssrc().await,
+                            _ => {
+                                info!("session_replaced_during_ssrc_check");
+                                drop(sessions);
+                                let _ = manager.leave(guild_id_obj).await;
+                                return Ok(());
+                            }
+                        }
                     };
                     if has_ssrc {
                         let dave_elapsed = dave_start.elapsed().as_secs_f64();
@@ -465,13 +541,27 @@ async fn handle_consent_button(
                     let _ = manager.leave(guild_id_obj).await;
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
+                    if pipeline_aborted(state, guild_id, &expected_id, &cancel).await {
+                        info!("startup_cancelled_between_dave_retries");
+                        return Ok(());
+                    }
+
                     match manager.join(guild_id_obj, channel_id).await {
                         Ok(new_call) => {
-                            // Re-attach to the new Call — reuses existing audio pipeline
+                            // Re-attach to the new Call — phase-guarded reattach.
                             let mut sessions = state.sessions.lock().await;
-                            let session = sessions.get_mut(guild_id).unwrap();
-                            let mut handler = new_call.lock().await;
-                            session.reattach_audio(&mut handler);
+                            match sessions.get_mut(guild_id) {
+                                Some(s) if s.id == expected_id => {
+                                    let mut handler = new_call.lock().await;
+                                    s.reattach_audio(&mut handler);
+                                }
+                                _ => {
+                                    info!("session_replaced_during_dave_rejoin");
+                                    drop(sessions);
+                                    let _ = manager.leave(guild_id_obj).await;
+                                    return Ok(());
+                                }
+                            }
                         }
                         Err(e) => {
                             error!(error = %e, attempt = attempt, "dave_rejoin_failed");
@@ -499,15 +589,27 @@ async fn handle_consent_button(
                     }
                 }
 
+                // DAVE confirmed. Abort-check once more before playing the
+                // announcement — /stop can fire between DAVE confirm and here.
+                if pipeline_aborted(state, guild_id, &expected_id, &cancel).await {
+                    info!("startup_cancelled_after_dave_confirm — leaving voice");
+                    let _ = manager.leave(guild_id_obj).await;
+                    return Ok(());
+                }
+
                 // Play "Recording has begun" announcement
-                {
-                    let call = manager.get(guild_id_obj).unwrap();
+                if let Some(call) = manager.get(guild_id_obj) {
                     let mut handler = call.lock().await;
                     let source = songbird::input::File::new("/assets/recording_started.wav");
                     let _ = handler.play_input(source.into());
                 }
                 // Brief pause to let the clip play before we start capturing
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                if pipeline_aborted(state, guild_id, &expected_id, &cancel).await {
+                    info!("startup_cancelled_during_announcement");
+                    return Ok(());
+                }
 
                 // Update consent embed: remove buttons, show recording status
                 let consent_msg = {

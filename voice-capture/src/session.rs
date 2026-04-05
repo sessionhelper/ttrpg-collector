@@ -79,6 +79,17 @@ pub struct Session {
 
     // Audio config
     pub audio_received: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Cooperative cancellation for the startup pipeline (voice join, DAVE
+    /// wait, recording_started). /stop and auto_stop flip this to `true`
+    /// before tearing the session down, so a concurrently-running startup
+    /// task can check the flag at each await point and bail out cleanly
+    /// instead of continuing to mutate a session that's being finalized.
+    ///
+    /// The flag is tied to this specific Session instance — it is a
+    /// separate `Arc` so the startup task can hold a clone that stays
+    /// valid even after the session is removed from the manager.
+    pub startup_cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
@@ -108,6 +119,7 @@ impl Session {
             license_followups: Vec::new(),
             license_cleanup_tasks: Vec::new(),
             audio_received: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            startup_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
