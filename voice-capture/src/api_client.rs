@@ -96,6 +96,11 @@ struct AddParticipantRequest {
 }
 
 #[derive(Serialize)]
+struct BatchAddParticipantsRequest {
+    participants: Vec<AddParticipantRequest>,
+}
+
+#[derive(Serialize)]
 struct UpdateConsentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     consent_scope: Option<String>,
@@ -345,8 +350,45 @@ impl DataApiClient {
         Ok(check_status(resp).await?.json().await?)
     }
 
+    /// Batch-add N participants to a session in a single HTTP round trip.
+    /// Upserts each user row first (sequentially — small N, not worth
+    /// parallelizing), then POSTs them all in one call to the Data API
+    /// batch endpoint. Returns the inserted rows in input order so
+    /// callers can map them back to their (discord_user_id, ...) tuples.
+    pub async fn add_participants_batch(
+        &self,
+        session_id: Uuid,
+        participants: &[(u64, bool)],
+    ) -> Result<Vec<ParticipantResponse>, ApiError> {
+        if participants.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut requests = Vec::with_capacity(participants.len());
+        for &(discord_user_id, mid_session_join) in participants {
+            let user = self.upsert_user(discord_user_id).await?;
+            requests.push(AddParticipantRequest {
+                user_id: Some(user.id),
+                mid_session_join: Some(mid_session_join),
+            });
+        }
+        let resp = self
+            .client
+            .post(format!(
+                "{}/internal/sessions/{}/participants/batch",
+                self.base_url, session_id
+            ))
+            .header("authorization", self.auth_header())
+            .json(&BatchAddParticipantsRequest {
+                participants: requests,
+            })
+            .send()
+            .await?;
+        Ok(check_status(resp).await?.json().await?)
+    }
+
     /// Record consent for a participant: resolve them via find_participant
-    /// and PATCH their consent row.
+    /// and PATCH their consent row. Fallback path used when the caller
+    /// does not have a cached participant UUID.
     pub async fn record_consent(
         &self,
         session_id: Uuid,
@@ -354,11 +396,22 @@ impl DataApiClient {
         scope: &str,
     ) -> Result<(), ApiError> {
         let participant = self.find_participant(session_id, discord_user_id).await?;
+        self.record_consent_by_id(participant.id, scope).await
+    }
+
+    /// Fast-path consent update for callers that already have the
+    /// participant's Data API UUID cached on the local Session. Skips
+    /// find_participant entirely — one HTTP round trip instead of three.
+    pub async fn record_consent_by_id(
+        &self,
+        participant_id: Uuid,
+        scope: &str,
+    ) -> Result<(), ApiError> {
         let resp = self
             .client
             .patch(format!(
                 "{}/internal/participants/{}/consent",
-                self.base_url, participant.id
+                self.base_url, participant_id
             ))
             .header("authorization", self.auth_header())
             .json(&UpdateConsentRequest {
@@ -372,23 +425,46 @@ impl DataApiClient {
     }
 
     /// Toggle a license flag (no_llm_training or no_public_release).
+    /// Fallback path. Returns the new (no_llm_training, no_public_release)
+    /// tuple for the caller to display in the refreshed button row.
     pub async fn toggle_license_flag(
         &self,
         session_id: Uuid,
         discord_user_id: u64,
         field: &str,
-    ) -> Result<(), ApiError> {
+    ) -> Result<(bool, bool), ApiError> {
         let participant = self.find_participant(session_id, discord_user_id).await?;
+        self.toggle_license_flag_by_id(
+            participant.id,
+            field,
+            participant.no_llm_training,
+            participant.no_public_release,
+        )
+        .await
+    }
+
+    /// Fast-path license toggle for callers that already have the
+    /// participant's Data API UUID cached AND know the current flag
+    /// values (e.g. from the previous PATCH response or the initial
+    /// add_participants_batch response). Returns the new
+    /// (no_llm_training, no_public_release) tuple.
+    pub async fn toggle_license_flag_by_id(
+        &self,
+        participant_id: Uuid,
+        field: &str,
+        current_no_llm: bool,
+        current_no_public: bool,
+    ) -> Result<(bool, bool), ApiError> {
         let (no_llm, no_public) = match field {
-            "no_llm_training" => (Some(!participant.no_llm_training), None),
-            "no_public_release" => (None, Some(!participant.no_public_release)),
-            _ => return Ok(()),
+            "no_llm_training" => (Some(!current_no_llm), None),
+            "no_public_release" => (None, Some(!current_no_public)),
+            _ => return Ok((current_no_llm, current_no_public)),
         };
         let resp = self
             .client
             .patch(format!(
                 "{}/internal/participants/{}/license",
-                self.base_url, participant.id
+                self.base_url, participant_id
             ))
             .header("authorization", self.auth_header())
             .json(&UpdateLicenseRequest {
@@ -397,8 +473,8 @@ impl DataApiClient {
             })
             .send()
             .await?;
-        check_status(resp).await?;
-        Ok(())
+        let updated: ParticipantResponse = check_status(resp).await?.json().await?;
+        Ok((updated.no_llm_training, updated.no_public_release))
     }
 
     /// Get license flags for a participant. Returns (false, false) when the
