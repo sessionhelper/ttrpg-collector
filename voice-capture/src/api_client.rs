@@ -272,8 +272,18 @@ impl DataApiClient {
         Ok(check_status(resp).await?.json().await?)
     }
 
-    /// Finalize a session: set ended_at, participant_count, and status=complete
-    /// (replaces db::finalize_session).
+    /// Finalize a session: set ended_at, participant_count, and
+    /// status="uploaded" — meaning the collector has finished uploading
+    /// all per-speaker audio chunks and the session is ready for
+    /// transcription. The `ovp-worker` polls `?status=uploaded` to find
+    /// work to pick up; from there the lifecycle continues
+    /// `uploaded → transcribing → transcribed`, owned by the worker.
+    ///
+    /// This used to write `status="complete"`, which was a slight misnomer
+    /// (the session isn't actually complete until transcription lands).
+    /// Renamed to `uploaded` in v0.5.3 so the state machine reads honestly
+    /// across the whole family of services. The collector now owns exactly
+    /// three DB statuses: `awaiting_consent → recording → uploaded`.
     pub async fn finalize_session(
         &self,
         session_id: Uuid,
@@ -287,7 +297,7 @@ impl DataApiClient {
             .json(&UpdateSessionRequest {
                 ended_at: Some(ended_at),
                 participant_count: Some(participant_count),
-                status: Some("complete".to_string()),
+                status: Some("uploaded".to_string()),
             })
             .send()
             .await?;
