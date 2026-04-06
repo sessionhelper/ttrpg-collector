@@ -73,7 +73,7 @@ pub async fn handle_voice_state_update(
     // If someone just rejoined and the channel isn't empty any more, abort
     // any pending timer so we don't auto-stop on them after they leave
     // again via a different path.
-    match channel_humans(&ctx, guild_id, channel_id) {
+    match channel_occupants(&ctx, guild_id, channel_id) {
         Some(0) => schedule_auto_stop(ctx.clone(), state.clone(), guild_id, channel_id).await,
         Some(_) => {
             let mut sessions = state.sessions.lock().await;
@@ -187,9 +187,25 @@ async fn handle_mid_session_join(
 // Auto-stop
 // ---------------------------------------------------------------------------
 
-/// Count non-bot users currently in the given voice channel. Returns None
-/// if the guild isn't cached.
-fn channel_humans(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> Option<usize> {
+/// Count "relevant" users currently in the given voice channel — humans
+/// plus any bot users on the bypass list. Returns None if the guild isn't
+/// cached.
+///
+/// Used by auto-stop to decide if the channel is "empty". Without the
+/// bypass check, bot-only channels (the E2E harness scenario) always
+/// return 0, which arms the auto-stop timer on every voice_state_update
+/// and kills the recording 30s later.
+fn channel_occupants(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> Option<usize> {
+    // Read bypass list once. The parse is cheap (small comma-sep string)
+    // and we can't store it outside this function without threading AppState
+    // through voice_state_update's call chain. Acceptable for an event
+    // that fires a few times per session, not per audio tick.
+    let bypass: std::collections::HashSet<u64> = std::env::var("BYPASS_CONSENT_USER_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
     let guild = ctx.cache.guild(guild_id)?.clone();
     Some(
         guild
@@ -197,10 +213,13 @@ fn channel_humans(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> Op
             .values()
             .filter(|vs| vs.channel_id == Some(channel_id))
             .filter(|vs| {
-                guild
-                    .members
-                    .get(&vs.user_id)
-                    .is_none_or(|m| !m.user.bot)
+                let member = guild.members.get(&vs.user_id);
+                let is_bot = member.is_some_and(|m| m.user.bot);
+                if !is_bot {
+                    return true; // human → always counts
+                }
+                // Bot → counts only if on the bypass list
+                bypass.contains(&vs.user_id.get())
             })
             .count(),
     )
@@ -222,7 +241,7 @@ async fn schedule_auto_stop(
     let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-        if channel_humans(&ctx_inner, guild_id, channel_id).is_none_or(|n| n > 0) {
+        if channel_occupants(&ctx_inner, guild_id, channel_id).is_none_or(|n| n > 0) {
             return;
         }
 
