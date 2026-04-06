@@ -7,6 +7,19 @@
 //! voice channel via their control API, POSTs here to start recording,
 //! drives the feeders to play their WAVs, then POSTs here again to stop.
 //!
+//! # DAVE/MLS staggering requirement
+//!
+//! Feeders MUST join voice one at a time with a ~5 second delay between
+//! each join. Discord's DAVE protocol uses MLS for key exchange, and each
+//! join triggers a proposal -> commit -> acknowledge cycle. If two feeders
+//! join before the first cycle completes, the MLS commit pipeline collides:
+//! the pending commit for feeder A is cleared when feeder B's proposal
+//! arrives, causing A's add to be lost from the MLS group. The collector
+//! then has no decryptor for A (NoDecryptorForUser), and A's audio is
+//! silently dropped as PLC silence.
+//!
+//! Use `scripts/e2e-run.sh` which enforces this staggering automatically.
+//!
 //! # Routes
 //!
 //! - `GET  /health` — liveness probe; also reports whether the collector
@@ -136,6 +149,14 @@ async fn record(
         ));
     }
 
+    // DAVE/MLS timing: feeders should join voice at least 10 seconds
+    // before this endpoint is called, to give the MLS group time to
+    // stabilize. If feeders join too close to the collector's join,
+    // the MLS commit pipeline races and some speakers' decryptors
+    // won't be established. The collector's DAVE heal task (spawned
+    // after recording_started) will detect and reconnect if this
+    // happens, but the 10-second buffer avoids it entirely.
+    //
     // Build participant list directly from the bypass list — don't
     // enumerate voice channel members. The feeders join AFTER recording
     // starts (to get clean per-feeder DAVE key exchanges), so they won't
