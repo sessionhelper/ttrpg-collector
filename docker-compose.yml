@@ -1,7 +1,0 @@
-services:
-  collector:
-    image: ghcr.io/sessionhelper/ttrpg-collector:latest
-    restart: always
-    env_file: .env
-    volumes:
-      - ./sessions:/tmp/rust-sessions
