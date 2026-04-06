@@ -136,8 +136,16 @@ async fn record(
         ));
     }
 
-    // Enumerate voice channel members from cache. Admit only bypass-listed
-    // users; everyone else is silently skipped.
+    // Build participant list directly from the bypass list — don't
+    // enumerate voice channel members. The feeders join AFTER recording
+    // starts (to get clean per-feeder DAVE key exchanges), so they won't
+    // be in the voice channel when /record fires. We know exactly who
+    // the participants will be from BYPASS_CONSENT_USER_IDS.
+    //
+    // Display names are looked up from the guild cache if available,
+    // otherwise a fallback is generated from the user ID. The feeders
+    // don't need to be in voice for this — they just need to be guild
+    // members (which they are, since they were invited).
     let members: Vec<(UserId, String)> = {
         let guild = ctx
             .cache
@@ -145,26 +153,19 @@ async fn record(
             .ok_or_else(|| err(StatusCode::NOT_FOUND, "guild not in cache"))?
             .clone();
 
-        guild
-            .voice_states
+        bypass_ids
             .iter()
-            .filter(|(_, vs)| vs.channel_id == Some(channel_id))
-            .filter(|(uid, _)| bypass_ids.contains(&uid.get()))
-            .filter_map(|(uid, _)| {
-                guild
+            .map(|&uid| {
+                let user_id = UserId::new(uid);
+                let name = guild
                     .members
-                    .get(uid)
-                    .map(|m| (*uid, m.display_name().to_string()))
+                    .get(&user_id)
+                    .map(|m| m.display_name().to_string())
+                    .unwrap_or_else(|| format!("bot_{}", uid));
+                (user_id, name)
             })
             .collect()
     };
-
-    if members.is_empty() {
-        return Err(err(
-            StatusCode::PRECONDITION_FAILED,
-            "no bypass-eligible members in voice channel",
-        ));
-    }
 
     // Build Session locally (uses collector bot's own user id as initiator,
     // since there's no human command.user.id in the headless path).
