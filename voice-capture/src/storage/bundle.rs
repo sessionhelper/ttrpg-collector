@@ -101,10 +101,8 @@ mod tests {
 
     #[test]
     fn pseudonymize_matches_sha256_first_8_bytes() {
-        // Known vector: SHA-256 of "308408759909351425" (the alex dev user
-        // id used in infra/collector.md testing), first 8 bytes hex = the
-        // pseudo_id observed in the e2e logs.
-        let p = pseudonymize(308408759909351425);
-        assert_eq!(p, "2f09cc7c1965a203");
+        // Known vector: SHA-256 of a synthetic ID, first 8 bytes hex.
+        let p = pseudonymize(123456789012345678);
+        assert_eq!(p, "37f96542b663971b");
     }
 }
