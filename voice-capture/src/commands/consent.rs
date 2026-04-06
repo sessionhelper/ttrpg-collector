@@ -24,6 +24,7 @@
 //! 7; the split brings every function under ~100 lines.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serenity::all::*;
 use tracing::{error, info, warn};
@@ -31,6 +32,7 @@ use tracing::{error, info, warn};
 use crate::commands::license;
 use crate::session::{consent_buttons, ConsentScope, Phase};
 use crate::state::AppState;
+use crate::voice::receiver::SPEAKER_AUDIO_THRESHOLD;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -393,6 +395,18 @@ pub(crate) async fn start_recording_headless(
 
     metrics::gauge!("ttrpg_sessions_active").increment(1.0);
     info!(session_id = %session_id, "recording_started (headless)");
+
+    // Spawn DAVE heal monitor — checks after 5s grace period whether
+    // every consented speaker has audio, reconnects once if not.
+    spawn_dave_heal_task(
+        state.sessions.clone(),
+        &manager,
+        guild_id,
+        guild_id_obj,
+        channel_id,
+        session_id.clone(),
+    );
+
     HeadlessStartOutcome::Recording
 }
 
@@ -492,6 +506,18 @@ async fn start_recording_pipeline(
 
     metrics::gauge!("ttrpg_sessions_active").increment(1.0);
     info!(session_id = %session_id, "recording_started");
+
+    // Spawn DAVE heal monitor — checks after 5s grace period whether
+    // every consented speaker has audio, reconnects once if not.
+    spawn_dave_heal_task(
+        state.sessions.clone(),
+        &manager,
+        guild_id,
+        guild_id_obj,
+        channel_id,
+        session_id.clone(),
+    );
+
     component
         .channel_id
         .say(&ctx.http, "Recording. Use `/stop` when done.")
@@ -780,6 +806,126 @@ async fn send_license_followup(
             session.license_cleanup_tasks.push(handle);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DAVE heal: detect speakers with broken decryptors and reconnect once
+// ---------------------------------------------------------------------------
+
+/// Spawn a one-shot background task that checks whether every consented
+/// speaker has received real audio within a grace period. If any speaker's
+/// DAVE decryptor never established (zero decoded packets after 5 seconds),
+/// the task leaves and rejoins voice to get a fresh MLS Welcome containing
+/// the full stable group, then plays the start announcement again.
+///
+/// This runs AT MOST ONCE per session — no retry loop. If the reconnect
+/// doesn't fix it, the loss is logged and accepted.
+fn spawn_dave_heal_task(
+    sessions: Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
+    manager: &Arc<songbird::Songbird>,
+    guild_id: u64,
+    guild_id_obj: GuildId,
+    channel_id: ChannelId,
+    session_id: String,
+) {
+    let heal_sessions = sessions;
+    let heal_manager = manager.clone();
+
+    tokio::spawn(async move {
+        // Grace period: let all speakers' DAVE decryptors establish
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Snapshot consented users and per-speaker audio counts
+        let (consented, speaker_counts) = {
+            let sessions = heal_sessions.lock().await;
+            let Some(s) = sessions.get(guild_id) else {
+                return;
+            };
+            match &s.phase {
+                Phase::Recording(data) => {
+                    let consented = data.consented_users.lock().await.clone();
+                    let counts = data
+                        .speakers_with_audio
+                        .lock()
+                        .expect("speakers_with_audio poisoned")
+                        .clone();
+                    (consented, counts)
+                }
+                _ => return, // Not recording anymore — nothing to heal
+            }
+        };
+
+        let missing: Vec<u64> = consented
+            .iter()
+            .filter(|uid| {
+                speaker_counts
+                    .get(uid)
+                    .is_none_or(|&c| c < SPEAKER_AUDIO_THRESHOLD)
+            })
+            .copied()
+            .collect();
+
+        if missing.is_empty() {
+            info!(
+                session_id = %session_id,
+                speakers = consented.len(),
+                "dave_heal_check_passed — all speakers have audio"
+            );
+            return;
+        }
+
+        warn!(
+            session_id = %session_id,
+            missing_speakers = missing.len(),
+            total_consented = consented.len(),
+            "dave_heal_triggered — reconnecting voice to refresh DAVE decryptors"
+        );
+
+        // Leave voice
+        let _ = heal_manager.leave(guild_id_obj).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Bail if the session was stopped while we were disconnected
+        {
+            let sessions = heal_sessions.lock().await;
+            match sessions.get(guild_id) {
+                Some(s) if s.id == session_id && !s.phase.is_terminal() => {}
+                _ => {
+                    info!(
+                        session_id = %session_id,
+                        "dave_heal_aborted — session ended during reconnect"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Rejoin voice to get a fresh MLS Welcome
+        match heal_manager.join(guild_id_obj, channel_id).await {
+            Ok(new_call) => {
+                let mut sessions = heal_sessions.lock().await;
+                if let Some(s) = sessions.get_mut(guild_id) {
+                    let mut handler = new_call.lock().await;
+                    s.reattach_audio(&mut handler);
+                }
+            }
+            Err(e) => {
+                error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "dave_heal_rejoin_failed"
+                );
+                return;
+            }
+        }
+
+        // Wait for DAVE on the fresh connection
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Play announcement again to signal the heal to users in voice
+        play_start_announcement(&heal_manager, guild_id_obj).await;
+        info!(session_id = %session_id, "dave_heal_complete");
+    });
 }
 
 // ---------------------------------------------------------------------------
