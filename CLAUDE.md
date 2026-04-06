@@ -22,20 +22,20 @@ voice-capture/
     config.rs            — clap env config
     state.rs             — AppState (sessions, api client)
     session.rs           — Session struct, Phase enum, consent state machine, metadata
+    harness.rs           — dev-only E2E harness HTTP server
     telemetry.rs         — metrics counters/gauges/histograms
     api_client.rs        — Data API HTTP client (auth, chunks, sessions, participants)
-    lib.rs               — library entry for tests
     commands/
-      record.rs          — /record slash command + consent embed
+      consent.rs         — consent button handler + recording startup pipeline
+      license.rs         — license preference toggles (no_llm, no_public)
+      record.rs          — /record slash command
       stop.rs            — /stop + auto-stop finalization
     voice/
+      events.rs          — voice_state_update: mid-session joins, auto-stop
       receiver.rs        — AudioReceiver, SSRC→user mapping, channel-based chunk upload
     storage/
       bundle.rs          — SessionMeta + ConsentRecord serde, pseudonymize() helper
-  migrations/            — reference SQL for the Data API schema (not run here)
   assets/                — TTS clips (recording_started.wav, recording_stopped.wav)
-scripts/
-  sync-s3.sh             — local data download for review
 legal/                   — privacy policy, ToS, consent text, dataset card
 ```
 
@@ -56,8 +56,11 @@ legal/                   — privacy policy, ToS, consent text, dataset card
 | `DATA_API_URL` | no | `http://127.0.0.1:8001` |
 | `DATA_API_SHARED_SECRET` | yes | — |
 | `LOCAL_BUFFER_DIR` | no | `./sessions` |
-| `MIN_PARTICIPANTS` | no | `2` |
+| `MIN_PARTICIPANTS` | no | `1` |
 | `REQUIRE_ALL_CONSENT` | no | `true` |
+| `BYPASS_CONSENT_USER_IDS` | no | (empty) |
+| `HARNESS_ENABLED` | no | `false` |
+| `HARNESS_PORT` | no | `8010` |
 
 ## Build / run
 

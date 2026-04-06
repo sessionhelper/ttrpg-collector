@@ -5,5 +5,9 @@ sessions/
 *.wav
 !voice-capture/assets/*.wav
 *.pcm
+*.png
+scripts/
 test-sessions/
 junk/
+data/
+voice-capture/assets/piper-models/
