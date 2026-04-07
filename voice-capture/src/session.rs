@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use serenity::all::{CreateEmbed, CreateButton, ButtonStyle, CreateActionRow};
 
 use crate::api_client::DataApiClient;
-use crate::voice::{AudioHandle, AudioPacket, AudioReceiver};
+use crate::voice::{AudioHandle, AudioPacket, AudioReceiver, Op5Event};
 use crate::storage::pseudonymize;
 use crate::storage::bundle::{
     SessionMeta, AudioFormat, ParticipantMeta, ConsentRecord, ConsentEntry,
@@ -65,11 +65,12 @@ pub struct RecordingPipeline {
     pub audio_handle: AudioHandle,
     pub ssrc_map: Arc<StdMutex<HashMap<u32, u64>>>,
     pub consented_users: Arc<Mutex<HashSet<u64>>>,
-    /// Set of user IDs that have had at least `SPEAKER_AUDIO_THRESHOLD`
-    /// VoiceTick packets with real (non-PLC) audio. Populated by the
-    /// VoiceTick handler; read by the DAVE heal task after the grace
-    /// period to detect speakers whose DAVE decryptors never established.
-    pub speakers_with_audio: Arc<StdMutex<HashMap<u64, u32>>>,
+    /// SSRCs that have appeared in VoiceTick with decoded audio. The DAVE
+    /// heal task checks this to confirm OP5-announced speakers are decoded.
+    pub ssrcs_seen: Arc<StdMutex<HashSet<u32>>>,
+    /// Receiver for OP5 events from SpeakingTracker. The DAVE heal task
+    /// takes ownership of this to detect new speakers and start timers.
+    pub op5_rx: Option<mpsc::UnboundedReceiver<Op5Event>>,
 }
 
 /// Full session lifecycle.
@@ -332,7 +333,8 @@ impl Session {
         let session_uuid =
             uuid::Uuid::parse_str(&self.id).expect("session id is always a valid UUID");
 
-        let speakers_with_audio = Arc::new(StdMutex::new(HashMap::new()));
+        let ssrcs_seen = Arc::new(StdMutex::new(HashSet::new()));
+        let (op5_tx, op5_rx) = mpsc::unbounded_channel();
 
         let (audio_tx, audio_handle) = AudioReceiver::create_pipeline(api, session_uuid);
         let ssrc_map = AudioReceiver::attach(
@@ -340,7 +342,8 @@ impl Session {
             audio_tx.clone(),
             consented_users.clone(),
             self.audio_received.clone(),
-            speakers_with_audio.clone(),
+            ssrcs_seen.clone(),
+            op5_tx,
         );
 
         self.phase = Phase::StartingRecording(RecordingPipeline {
@@ -348,7 +351,8 @@ impl Session {
             audio_handle,
             ssrc_map,
             consented_users,
-            speakers_with_audio,
+            ssrcs_seen,
+            op5_rx: Some(op5_rx),
         });
 
         audio_tx
@@ -377,14 +381,19 @@ impl Session {
             Phase::Recording(data) => data,
             _ => return,
         };
+        // Create a fresh OP5 channel for the new Call's SpeakingTracker.
+        // The old op5_tx is dropped with the old Call's event handlers.
+        let (op5_tx, op5_rx) = mpsc::unbounded_channel();
         let new_ssrc_map = AudioReceiver::attach(
             call,
             phase.audio_tx.clone(),
             phase.consented_users.clone(),
             self.audio_received.clone(),
-            phase.speakers_with_audio.clone(),
+            phase.ssrcs_seen.clone(),
+            op5_tx,
         );
         phase.ssrc_map = new_ssrc_map;
+        phase.op5_rx = Some(op5_rx);
     }
 
     /// Check if DAVE is delivering audio. Returns the underlying atomic flag

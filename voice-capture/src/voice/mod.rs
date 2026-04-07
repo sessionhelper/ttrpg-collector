@@ -3,4 +3,4 @@
 pub mod events;
 pub mod receiver;
 
-pub use receiver::{AudioHandle, AudioPacket, AudioReceiver};
+pub use receiver::{AudioHandle, AudioPacket, AudioReceiver, Op5Event};
