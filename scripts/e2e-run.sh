@@ -214,7 +214,53 @@ else
 fi
 
 echo ""
-echo "=== E2E run complete (session: $SESSION_ID) ==="
+
+# --- Step 6: Wait for session upload to complete ---
+
+echo "--- Waiting for session upload ---"
+DATA_API_URL="${DATA_API_URL:-http://127.0.0.1:8001}"
+SHARED_SECRET="${SHARED_SECRET:?SHARED_SECRET is required for audio diff}"
+
+# Authenticate
+API_TOKEN=$(curl -sf "$DATA_API_URL/internal/auth" \
+    -H "Content-Type: application/json" \
+    -d "{\"shared_secret\": \"$SHARED_SECRET\", \"service_name\": \"e2e-test\"}" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_token',''))" 2>/dev/null)
+
+if [[ -z "$API_TOKEN" ]]; then
+    echo "WARNING: could not authenticate with data-api, skipping audio diff"
+else
+    # Wait for status=uploaded (or transcribing/transcribed if worker is fast)
+    for i in $(seq 1 30); do
+        status=$(curl -sf "$DATA_API_URL/internal/sessions/$SESSION_ID" \
+            -H "Authorization: Bearer $API_TOKEN" 2>/dev/null \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+        if [[ "$status" == "uploaded" || "$status" == "transcribing" || "$status" == "transcribed" ]]; then
+            echo "  Session status: $status"
+            break
+        fi
+        sleep 1
+    done
+
+    # --- Step 7: Audio waveform evaluation ---
+
+    AUDIO_DIFF="${AUDIO_DIFF:-/home/alex/test-data/audio-diff.py}"
+    SOURCE_DIR="${SOURCE_DIR:-/home/alex/test-data/sessions/04-chaotic-tavern/audio}"
+
+    if [[ -f "$AUDIO_DIFF" ]]; then
+        echo ""
+        echo "--- Audio waveform evaluation ---"
+        uv run --with "scipy<1.17" --with numpy --with requests \
+            python3 "$AUDIO_DIFF" \
+            --session-id "$SESSION_ID" \
+            --data-api-url "$DATA_API_URL" \
+            --shared-secret "$SHARED_SECRET" \
+            --source-dir "$SOURCE_DIR" \
+            2>&1 || echo "WARNING: audio-diff failed (non-fatal)"
+    else
+        echo "  Skipping audio diff ($AUDIO_DIFF not found)"
+    fi
+fi
+
 echo ""
-echo "Check the collector logs for voice_tick_diagnostic output."
-echo "All $FEEDER_COUNT feeders should show non-zero decoded audio."
+echo "=== E2E run complete (session: $SESSION_ID) ==="
