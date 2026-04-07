@@ -966,12 +966,24 @@ fn spawn_dave_heal_task(
         info!(session_id = %session_id, healed, "recording_stable");
 
         // --- Continuous monitoring ---
-        // Keep consuming OP5 events for the rest of the session. If a new
-        // OP5 fires and the SSRC doesn't appear in VoiceTick within 2s,
-        // trigger a one-shot heal (if we haven't already healed).
+        // Two detection paths run in parallel:
+        // 1. OP5 events: if a new OP5 fires and the SSRC doesn't appear
+        //    in VoiceTick within 2s, DAVE is broken.
+        // 2. Periodic fallback (every 10s): if ssrcs_seen has entries that
+        //    ssrc_map doesn't, OP5 was edge-triggered away and we missed it.
+        //    This catches the case where feeders were already in "speaking"
+        //    state before the collector joined.
+        let mut fallback_interval = tokio::time::interval(Duration::from_secs(10));
+        fallback_interval.tick().await; // consume the immediate first tick
+
         loop {
-            match op5_rx.recv().await {
-                Some(evt) => {
+            tokio::select! {
+                evt = op5_rx.recv() => {
+                    let Some(evt) = evt else {
+                        info!(session_id = %session_id, "dave_monitor_exit — session ended");
+                        return;
+                    };
+
                     // Already seen this SSRC? Skip.
                     {
                         let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
@@ -985,11 +997,10 @@ fn spawn_dave_heal_task(
                     {
                         let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
                         if seen.contains(&evt.ssrc) {
-                            continue; // Confirmed, DAVE working for this speaker
+                            continue;
                         }
                     }
 
-                    // DAVE broken for this speaker mid-session
                     if healed {
                         warn!(
                             session_id = %session_id,
@@ -1009,9 +1020,7 @@ fn spawn_dave_heal_task(
                         channel_id, &session_id,
                     ).await;
 
-                    // After a heal, op5_rx is stale (old Call's SpeakingTracker
-                    // is gone). We need the new op5_rx from reattach_audio.
-                    // Take it from the session.
+                    // After heal, take the new op5_rx from the fresh Call
                     let new_rx = {
                         let mut sessions = heal_sessions.lock().await;
                         sessions.get_mut(guild_id).and_then(|s| match &mut s.phase {
@@ -1027,10 +1036,39 @@ fn spawn_dave_heal_task(
                         }
                     }
                 }
-                None => {
-                    // Channel closed — session ended
-                    info!(session_id = %session_id, "dave_monitor_exit — session ended");
-                    return;
+
+                _ = fallback_interval.tick() => {
+                    if healed { continue; }
+
+                    let seen_count = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
+                    let mapped_count = ssrc_map.lock().expect("ssrc_map poisoned").len();
+
+                    if seen_count > 0 && mapped_count < consented_count {
+                        warn!(
+                            session_id = %session_id,
+                            seen = seen_count, mapped = mapped_count, consented = consented_count,
+                            "dave_heal_triggered — SSRCs in VoiceTick but unmapped (OP5 edge-trigger missed)"
+                        );
+                        healed = do_heal(
+                            &heal_sessions, &heal_manager, guild_id, guild_id_obj,
+                            channel_id, &session_id,
+                        ).await;
+
+                        let new_rx = {
+                            let mut sessions = heal_sessions.lock().await;
+                            sessions.get_mut(guild_id).and_then(|s| match &mut s.phase {
+                                Phase::Recording(data) => data.op5_rx.take(),
+                                _ => None,
+                            })
+                        };
+                        match new_rx {
+                            Some(rx) => *op5_rx = rx,
+                            None => {
+                                info!(session_id = %session_id, "dave_monitor_exit — no new op5_rx after heal");
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }
