@@ -17,8 +17,8 @@ use uuid::Uuid;
 use crate::api_client::DataApiClient;
 use crate::storage::pseudonymize;
 
-/// 5MB chunk size — ~26 seconds of 48kHz stereo s16le audio per speaker
-const CHUNK_SIZE: usize = 5 * 1024 * 1024;
+/// 2MB chunk size — ~10.9 seconds of 48kHz stereo s16le audio per speaker (R5)
+const CHUNK_SIZE: usize = 2 * 1024 * 1024;
 
 /// Audio data sent from the VoiceTick handler to the buffer task via channel.
 /// This keeps the hot path lock-free.
@@ -28,7 +28,7 @@ pub struct AudioPacket {
     data: Vec<i16>,
 }
 
-/// Per-speaker buffer that uploads 5MB chunks via the Data API when full.
+/// Per-speaker buffer that uploads 2MB chunks via the Data API when full.
 struct SpeakerBuffer {
     pseudo_id: String,
     buffer: Vec<u8>,
@@ -108,11 +108,6 @@ impl AudioHandle {
     }
 }
 
-/// Minimum number of VoiceTick packets with real signal before a speaker
-/// is considered "has audio" by the DAVE heal check. Avoids false positives
-/// from transient noise or a single decoded frame during handshake churn.
-pub const SPEAKER_AUDIO_THRESHOLD: u32 = 10;
-
 pub struct AudioReceiver {
     /// Channel sender — VoiceTick pushes audio here, no buffer lock needed
     tx: mpsc::Sender<AudioPacket>,
@@ -123,10 +118,10 @@ pub struct AudioReceiver {
     consented_users: Arc<Mutex<HashSet<u64>>>,
     /// Shared flag: set to true once decoded audio arrives (DAVE watchdog)
     pub audio_received: Arc<std::sync::atomic::AtomicBool>,
-    /// Per-speaker packet count with real (non-PLC) audio. Keyed by Discord
-    /// user ID. The DAVE heal task reads this after its grace period to find
-    /// speakers whose decryptors never established.
-    speakers_with_audio: Arc<StdMutex<HashMap<u64, u32>>>,
+    /// SSRCs that have appeared in VoiceTick with decoded audio. The DAVE
+    /// heal task reads this to confirm that OP5-announced speakers are
+    /// actually being decoded. Replaces the old amplitude-based check.
+    ssrcs_seen: Arc<StdMutex<HashSet<u32>>>,
 }
 
 impl AudioReceiver {
@@ -158,7 +153,8 @@ impl AudioReceiver {
         tx: mpsc::Sender<AudioPacket>,
         consented_users: Arc<Mutex<HashSet<u64>>>,
         audio_received: Arc<std::sync::atomic::AtomicBool>,
-        speakers_with_audio: Arc<StdMutex<HashMap<u64, u32>>>,
+        ssrcs_seen: Arc<StdMutex<HashSet<u32>>>,
+        op5_tx: mpsc::UnboundedSender<Op5Event>,
     ) -> Arc<StdMutex<HashMap<u32, u64>>> {
         let ssrc_map = Arc::new(StdMutex::new(HashMap::new()));
 
@@ -167,12 +163,13 @@ impl AudioReceiver {
             ssrc_to_user: ssrc_map.clone(),
             consented_users,
             audio_received,
-            speakers_with_audio,
+            ssrcs_seen,
         };
         call.add_global_event(CoreEvent::VoiceTick.into(), receiver);
 
         let tracker = SpeakingTracker {
             ssrc_to_user: ssrc_map.clone(),
+            op5_tx,
         };
         call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), tracker);
 
@@ -273,17 +270,12 @@ impl VoiceEventHandler for AudioReceiver {
                 if let Some(decoded) = &data.decoded_voice {
                     metrics::counter!("ttrpg_audio_packets_received").increment(1);
 
-                    // Track per-speaker audio for the DAVE heal check.
-                    // Only count packets with real signal (abs > 10 threshold
-                    // filters PLC silence which is exactly 0).
-                    let has_signal = decoded.iter().any(|&s| s.abs() > 10);
-                    if has_signal {
-                        let mut speakers = self
-                            .speakers_with_audio
-                            .lock()
-                            .expect("speakers_with_audio poisoned");
-                        let count = speakers.entry(user_id).or_insert(0);
-                        *count = count.saturating_add(1);
+                    // Record that this SSRC has delivered decoded audio.
+                    // The DAVE heal task checks this set to confirm that
+                    // OP5-announced speakers are actually being decoded.
+                    {
+                        let mut seen = self.ssrcs_seen.lock().expect("ssrcs_seen poisoned");
+                        seen.insert(*ssrc);
                     }
 
                     // Send to buffer task via channel — no lock contention
@@ -415,9 +407,19 @@ fn process_packet(
     }
 }
 
-/// Tracks SSRC → user_id mappings from Discord speaking events.
+/// OP5 event sent from SpeakingTracker to the DAVE heal system.
+/// Signals that Discord's voice server reported a user started transmitting.
+pub struct Op5Event {
+    pub ssrc: u32,
+    pub user_id: u64,
+}
+
+/// Tracks SSRC → user_id mappings from Discord speaking events and
+/// notifies the DAVE heal system when a user starts transmitting.
 struct SpeakingTracker {
     ssrc_to_user: Arc<StdMutex<HashMap<u32, u64>>>,
+    /// Channel to notify the DAVE heal task that OP5 fired for a user.
+    op5_tx: mpsc::UnboundedSender<Op5Event>,
 }
 
 #[async_trait]
@@ -430,10 +432,20 @@ impl VoiceEventHandler for SpeakingTracker {
             match speaking.user_id {
                 Some(uid) => {
                     let mut map = self.ssrc_to_user.lock().expect("ssrc_map poisoned");
-                    if !map.contains_key(&speaking.ssrc) {
+                    let is_new = !map.contains_key(&speaking.ssrc);
+                    if is_new {
                         info!(ssrc = speaking.ssrc, user_id = %uid, "ssrc_mapped");
                     }
                     map.insert(speaking.ssrc, uid.0);
+
+                    // Notify the DAVE heal system that this user started
+                    // transmitting. The heal task starts a 2s timer — if
+                    // the SSRC doesn't appear in VoiceTick by then, DAVE
+                    // decryption is broken.
+                    let _ = self.op5_tx.send(Op5Event {
+                        ssrc: speaking.ssrc,
+                        user_id: uid.0,
+                    });
                 }
                 None => {
                     tracing::debug!(
