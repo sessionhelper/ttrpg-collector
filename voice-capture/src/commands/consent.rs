@@ -963,6 +963,7 @@ fn spawn_dave_heal_task(
             play_start_announcement(&heal_manager, guild_id_obj).await;
         }
         stable_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stable_set_at = std::time::Instant::now();
         info!(session_id = %session_id, healed, "recording_stable");
 
         // --- Continuous monitoring ---
@@ -1042,13 +1043,29 @@ fn spawn_dave_heal_task(
 
                     let seen_count = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
                     let mapped_count = ssrc_map.lock().expect("ssrc_map poisoned").len();
+                    let secs_since_stable = stable_set_at.elapsed().as_secs();
 
                     if seen_count > 0 && mapped_count < consented_count {
+                        // SSRCs in VoiceTick but unmapped — edge-trigger missed
                         warn!(
                             session_id = %session_id,
                             seen = seen_count, mapped = mapped_count, consented = consented_count,
                             "dave_heal_triggered — SSRCs in VoiceTick but unmapped (OP5 edge-trigger missed)"
                         );
+                    } else if seen_count == 0 && mapped_count == 0 && secs_since_stable >= 30 {
+                        // 30s after stable, still no SSRCs at all. DAVE
+                        // connection is completely dead — no decoded audio,
+                        // no OP5, nothing. Force heal.
+                        warn!(
+                            session_id = %session_id,
+                            secs_since_stable,
+                            "dave_heal_triggered — no SSRCs seen 30s after stable, connection dead"
+                        );
+                    } else {
+                        continue;
+                    }
+
+                    {
                         healed = do_heal(
                             &heal_sessions, &heal_manager, guild_id, guild_id_obj,
                             channel_id, &session_id,
