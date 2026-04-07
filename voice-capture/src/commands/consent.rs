@@ -839,7 +839,7 @@ fn spawn_dave_heal_task(
 
     tokio::spawn(async move {
         // Take the op5_rx from the session — this heal task owns it.
-        let (mut op5_rx, ssrcs_seen) = {
+        let (mut op5_rx, ssrcs_seen, ssrc_map, consented_count) = {
             let mut sessions = heal_sessions.lock().await;
             let Some(s) = sessions.get_mut(guild_id) else {
                 return;
@@ -848,7 +848,9 @@ fn spawn_dave_heal_task(
                 Phase::Recording(data) | Phase::StartingRecording(data) => {
                     let rx = data.op5_rx.take();
                     let seen = data.ssrcs_seen.clone();
-                    (rx, seen)
+                    let map = data.ssrc_map.clone();
+                    let count = data.consented_users.lock().await.len();
+                    (rx, seen, map, count)
                 }
                 _ => return,
             }
@@ -910,12 +912,43 @@ fn spawn_dave_heal_task(
             }
         }
 
+        // Fallback: OP5 is edge-triggered. If feeders were already speaking
+        // when the collector joined, OP5 never fires and the check above
+        // passes vacuously. Detect this by comparing: we expect consented
+        // users to have mapped SSRCs. If ssrc_map is empty but ssrcs_seen
+        // has entries, OP5 was missed and we should reconnect to get fresh
+        // OP5 events + a new MLS Welcome.
         if broken_ssrcs.is_empty() {
-            info!(
-                session_id = %session_id,
-                "dave_heal_check_passed — all OP5 speakers confirmed in VoiceTick"
-            );
-            return;
+            let mapped_count = ssrc_map.lock().expect("ssrc_map poisoned").len();
+            let seen_count = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
+
+            if mapped_count < consented_count && seen_count > 0 {
+                warn!(
+                    session_id = %session_id,
+                    mapped = mapped_count,
+                    seen = seen_count,
+                    consented = consented_count,
+                    "dave_heal_triggered — SSRCs in VoiceTick but OP5 never mapped them \
+                     (edge-trigger missed, likely DAVE broken)"
+                );
+                // Fall through to the heal path below
+            } else if mapped_count < consented_count && seen_count == 0 {
+                warn!(
+                    session_id = %session_id,
+                    mapped = mapped_count,
+                    consented = consented_count,
+                    "dave_heal_triggered — no SSRCs seen at all after grace period"
+                );
+                // Fall through to heal
+            } else {
+                info!(
+                    session_id = %session_id,
+                    mapped = mapped_count,
+                    seen = seen_count,
+                    "dave_heal_check_passed — all OP5 speakers confirmed in VoiceTick"
+                );
+                return;
+            }
         }
 
         // Check session is still active before healing
