@@ -908,18 +908,27 @@ fn spawn_dave_heal_task(
             }
         }
 
-        // Fallback: if no OP5 events fired at all (edge-trigger missed),
-        // check ssrc_map vs consented count.
+        // Fallback: OP5 is edge-triggered. If speakers were already
+        // transmitting when the collector joined, OP5 never fires and the
+        // check above passes vacuously. Detect this by comparing ssrc_map
+        // against ssrcs_seen: if VoiceTick is delivering SSRCs that OP5
+        // never mapped, the edge-trigger was missed and DAVE is likely broken.
+        //
+        // If seen=0 AND mapped=0, nobody is transmitting — that's normal
+        // (e.g. feeders waiting for the stable signal, or players not
+        // talking yet). Do NOT heal in this case.
         let needs_heal = if !broken_ssrcs.is_empty() {
             true
         } else {
             let mapped = ssrc_map.lock().expect("ssrc_map poisoned").len();
             let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
-            if mapped < consented_count {
+            if seen > 0 && mapped < consented_count {
+                // SSRCs in VoiceTick but not all mapped via OP5 — edge-trigger
+                // missed, DAVE decryption likely broken for unmapped speakers.
                 warn!(
                     session_id = %session_id,
                     mapped, seen, consented = consented_count,
-                    "dave_heal_triggered — {} mapped of {} consented after grace period",
+                    "dave_heal_triggered — SSRCs seen but only {} of {} mapped",
                     mapped, consented_count,
                 );
                 true
