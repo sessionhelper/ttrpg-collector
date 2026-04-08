@@ -45,7 +45,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -92,6 +92,18 @@ struct HealthResponse {
     bypass_user_count: usize,
 }
 
+#[derive(Deserialize, Debug)]
+struct StatusQuery {
+    guild_id: u64,
+}
+
+#[derive(Serialize, Debug)]
+struct StatusResponse {
+    recording: bool,
+    stable: bool,
+    session_id: Option<String>,
+}
+
 #[derive(Serialize, Debug)]
 struct ErrorResponse {
     error: String,
@@ -111,6 +123,28 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         harness_enabled: state.config.harness_enabled,
         bypass_user_count: state.config.bypass_consent_user_ids().len(),
     })
+}
+
+/// Check recording status for a guild. The E2E test runner polls this
+/// after /record to know when the DAVE heal check has settled and feeders
+/// can start transmitting.
+async fn status(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<StatusQuery>,
+) -> Json<StatusResponse> {
+    let sessions = state.sessions.lock().await;
+    match sessions.get(q.guild_id) {
+        Some(s) => Json(StatusResponse {
+            recording: matches!(s.phase, crate::session::Phase::Recording(_)),
+            stable: s.is_stable(),
+            session_id: Some(s.id.clone()),
+        }),
+        None => Json(StatusResponse {
+            recording: false,
+            stable: false,
+            session_id: None,
+        }),
+    }
 }
 
 /// Start a recording session headlessly.
@@ -376,6 +410,7 @@ async fn stop(
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/record", post(record))
         .route("/stop", post(stop))
         .with_state(state)
