@@ -837,7 +837,7 @@ fn spawn_dave_heal_task(
 
     tokio::spawn(async move {
         // Take the op5_rx and shared state from the session.
-        let (mut op5_rx, ssrcs_seen, ssrc_map, consented_count, stable_flag) = {
+        let (mut op5_rx, ssrcs_seen, ssrc_map, consented_users, stable_flag) = {
             let mut sessions = heal_sessions.lock().await;
             let Some(s) = sessions.get_mut(guild_id) else {
                 return;
@@ -848,8 +848,8 @@ fn spawn_dave_heal_task(
                     let rx = data.op5_rx.take();
                     let seen = data.ssrcs_seen.clone();
                     let map = data.ssrc_map.clone();
-                    let count = data.consented_users.lock().await.len();
-                    (rx, seen, map, count, stable)
+                    let cu = data.consented_users.clone();
+                    (rx, seen, map, cu, stable)
                 }
                 _ => return,
             }
@@ -921,6 +921,7 @@ fn spawn_dave_heal_task(
         } else {
             let mapped = ssrc_map.lock().expect("ssrc_map poisoned").len();
             let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
+            let consented_count = consented_users.lock().await.len();
             if seen > 0 && mapped < consented_count {
                 // SSRCs in VoiceTick but not all mapped via OP5 — edge-trigger
                 // missed, DAVE decryption likely broken for unmapped speakers.
@@ -993,8 +994,11 @@ fn spawn_dave_heal_task(
                         }
                     }
 
-                    // New SSRC from OP5 — give 2s for VoiceTick to confirm
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    // New SSRC from OP5 — give 10s for VoiceTick to confirm.
+                    // The DAVE protocol retains previous epoch keys for up to
+                    // 10 seconds during transitions. A 2s timer caused false
+                    // heals during normal epoch renegotiations (e.g. human joins).
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                     {
                         let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
                         if seen.contains(&evt.ssrc) {
@@ -1044,6 +1048,9 @@ fn spawn_dave_heal_task(
                     let seen_count = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
                     let mapped_count = ssrc_map.lock().expect("ssrc_map poisoned").len();
                     let secs_since_stable = stable_set_at.elapsed().as_secs();
+                    // Re-read consented count live — it changes when mid-session
+                    // joiners are added to the consented_users set.
+                    let consented_count = consented_users.lock().await.len();
 
                     if seen_count > 0 && mapped_count < consented_count {
                         // SSRCs in VoiceTick but unmapped — edge-trigger missed

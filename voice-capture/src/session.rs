@@ -387,6 +387,12 @@ impl Session {
             Phase::Recording(data) => data,
             _ => return,
         };
+        // Clear stale state from the old connection. ssrcs_seen entries
+        // from the broken connection would mask failures in the new one.
+        {
+            let mut seen = phase.ssrcs_seen.lock().expect("ssrcs_seen poisoned");
+            seen.clear();
+        }
         // Create a fresh OP5 channel for the new Call's SpeakingTracker.
         // The old op5_tx is dropped with the old Call's event handlers.
         let (op5_tx, op5_rx) = mpsc::unbounded_channel();
