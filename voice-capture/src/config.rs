@@ -6,7 +6,7 @@ use clap::Parser;
 
 /// Bot configuration, populated from CLI args or environment variables.
 #[derive(Parser, Clone)]
-#[command(name = "ttrpg-collector", about = "TTRPG session audio collector bot")]
+#[command(name = "chronicle-bot", about = "TTRPG session audio collector bot")]
 pub struct Config {
     /// Discord bot token
     #[arg(long, env = "DISCORD_TOKEN")]
@@ -39,7 +39,7 @@ pub struct Config {
     /// prod deployment leaves this empty and the collector therefore never
     /// bypasses consent.
     ///
-    /// This exists so the feeder-bot fleet in `ttrpg-collector-feeder` can
+    /// This exists so the feeder-bot fleet in `chronicle-feeder` can
     /// be recorded during E2E runs — those bots can't click Discord buttons
     /// on their own. Setting this list to non-empty on a prod deployment
     /// would break the consent contract with real users.

@@ -1,10 +1,10 @@
 [package]
-name = "ttrpg-collector"
+name = "chronicle-bot"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "ttrpg-collector"
+name = "chronicle-bot"
 path = "src/main.rs"
 
 [dependencies]

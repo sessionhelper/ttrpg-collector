@@ -1,4 +1,4 @@
-# ttrpg-collector — Architecture
+# chronicle-bot — Architecture
 
 ## Overview
 
@@ -18,7 +18,7 @@ Discord Voice Channel
          │
          │ HTTP (Bearer token, shared-secret auth)
          ▼
-    ovp-data-api
+    chronicle-data-api
       • Owns Postgres (sessions, participants, consent, audit)
       • Owns S3 (audio chunks, metadata files)
 ```

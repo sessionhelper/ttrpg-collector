@@ -38,7 +38,7 @@ jobs:
 
       # Deploy to the OVP compose stack on the production VPS. The stack
       # lives at /opt/ovp/ and is supervised by systemd via
-      # ovp-data-api.service (which despite the name brings up the whole
+      # chronicle-data-api.service (which despite the name brings up the whole
       # compose stack — postgres, data-api, collector). Pulling the new
       # collector image and restarting the service is enough; the
       # systemd unit's ExecStart runs `docker compose up -d` which
@@ -52,5 +52,5 @@ jobs:
           script: |
             cd /opt/ovp
             docker compose pull collector
-            systemctl restart ovp-data-api
+            systemctl restart chronicle-data-api
             docker image prune -f

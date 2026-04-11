@@ -1,4 +1,4 @@
-# ttrpg-collector
+# chronicle-bot
 
 Discord bot that records TTRPG voice sessions for an open audio transcription dataset.
 

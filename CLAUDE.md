@@ -1,4 +1,4 @@
-# ttrpg-collector
+# chronicle-bot
 
 > Org-wide conventions (Rust style, git workflow, shared-secret auth, pseudonymization, cross-service architecture) live in `/home/alex/sessionhelper-hub/CLAUDE.md`. Read that first for anything cross-cutting.
 
@@ -11,7 +11,7 @@ Discord bot that captures TTRPG session audio with per-participant consent and u
 - `davey` — MLS/AES-256-GCM for DAVE
 - `opus2` — Opus decode
 - `reqwest` — talks to the Data API (never touches S3 or Postgres directly)
-- No `ffmpeg` at runtime — raw PCM goes up, `ovp-pipeline` handles audio processing downstream.
+- No `ffmpeg` at runtime — raw PCM goes up, `chronicle-pipeline` handles audio processing downstream.
 
 ## Layout
 
@@ -76,10 +76,10 @@ Build deps: `cmake` (for Opus). No `ffmpeg` needed.
 ## E2E test harness (dev only)
 
 The end-to-end harness feeder bot lives in its own sibling repo,
-[`ttrpg-collector-feeder`](https://github.com/sessionhelper/ttrpg-collector-feeder).
+[`chronicle-feeder`](https://github.com/sessionhelper/chronicle-feeder).
 It's a minimal Discord bot that joins a voice channel and plays a
 pre-recorded WAV on demand via a loopback HTTP control API. Prod builds of
-`ttrpg-collector` never include any harness code.
+`chronicle-bot` never include any harness code.
 
 See `infra/dev-compose.yml` in `sessionhelper-hub` for the four feeder
 services (moe, larry, curly, gygax).

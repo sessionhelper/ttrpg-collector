@@ -125,7 +125,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("ttrpg_collector=info".parse().unwrap())
+                .add_directive("chronicle_bot=info".parse().unwrap())
                 .add_directive("songbird=error".parse().unwrap())
                 .add_directive("songbird::driver::tasks::udp_rx=off".parse().unwrap())
                 .add_directive("serenity=warn".parse().unwrap()),

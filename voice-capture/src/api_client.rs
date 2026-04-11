@@ -275,7 +275,7 @@ impl DataApiClient {
     /// Finalize a session: set ended_at, participant_count, and
     /// status="uploaded" — meaning the collector has finished uploading
     /// all per-speaker audio chunks and the session is ready for
-    /// transcription. The `ovp-worker` polls `?status=uploaded` to find
+    /// transcription. The `chronicle-worker` polls `?status=uploaded` to find
     /// work to pick up; from there the lifecycle continues
     /// `uploaded → transcribing → transcribed`, owned by the worker.
     ///

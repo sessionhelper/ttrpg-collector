@@ -350,6 +350,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronicle-bot"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytemuck",
+ "chrono",
+ "clap",
+ "hex",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "reqwest",
+ "rustls 0.23.37",
+ "serde",
+ "serde_json",
+ "serenity",
+ "sha2",
+ "songbird",
+ "symphonia",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4220,33 +4247,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "ttrpg-collector"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytemuck",
- "chrono",
- "clap",
- "hex",
- "metrics",
- "metrics-exporter-prometheus",
- "reqwest",
- "rustls 0.23.37",
- "serde",
- "serde_json",
- "serenity",
- "sha2",
- "songbird",
- "symphonia",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "walkdir",
-]
 
 [[package]]
 name = "tungstenite"

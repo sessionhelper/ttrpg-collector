@@ -183,7 +183,7 @@ impl VoiceEventHandler for AudioReceiver {
         if let EventContext::VoiceTick(VoiceTick { speaking, .. }) = ctx {
             // --- DIAGNOSTIC: log raw VoiceTick shape during startup ---
             // This runs on EVERY tick (~20ms), so only emit at debug level.
-            // Turn on via RUST_LOG=ttrpg_collector::voice::receiver=debug
+            // Turn on via RUST_LOG=chronicle_bot::voice::receiver=debug
             // to see whether songbird is delivering ticks at all during
             // the DAVE wait window.
             //
@@ -268,7 +268,7 @@ impl VoiceEventHandler for AudioReceiver {
                 };
 
                 if let Some(decoded) = &data.decoded_voice {
-                    metrics::counter!("ttrpg_audio_packets_received").increment(1);
+                    metrics::counter!("chronicle_audio_packets_received").increment(1);
 
                     // Record that this SSRC has delivered decoded audio.
                     // The DAVE heal task checks this set to confirm that
@@ -318,7 +318,7 @@ async fn buffer_task(
                 // Log status every 10 seconds
                 if last_status.elapsed() >= std::time::Duration::from_secs(10) {
                     let buffered: u64 = buffers.values().map(|b| b.buffer.len() as u64).sum();
-                    metrics::gauge!("ttrpg_audio_bytes_buffered").set(buffered as f64);
+                    metrics::gauge!("chronicle_audio_bytes_buffered").set(buffered as f64);
                     info!(
                         packets = packet_count,
                         total_bytes = total_bytes,
@@ -341,7 +341,7 @@ async fn buffer_task(
     }
 
     // Flush all remaining speaker buffers
-    metrics::gauge!("ttrpg_audio_bytes_buffered").set(0.0);
+    metrics::gauge!("chronicle_audio_bytes_buffered").set(0.0);
     info!(speakers = buffers.len(), "flushing_audio_buffers");
     for (ssrc, buffer) in buffers.iter_mut() {
         if let Some(chunk) = buffer.flush() {
@@ -350,13 +350,13 @@ async fn buffer_task(
             match api.upload_chunk(session_id, &chunk.pseudo_id, chunk.data).await {
                 Ok(_) => {
                     let elapsed = upload_start.elapsed().as_secs_f64();
-                    metrics::histogram!("ttrpg_audio_chunk_upload_seconds").record(elapsed);
-                    metrics::counter!("ttrpg_audio_chunks_uploaded").increment(1);
-                    metrics::counter!("ttrpg_uploads_total", "type" => "chunk", "outcome" => "success").increment(1);
+                    metrics::histogram!("chronicle_audio_chunk_upload_seconds").record(elapsed);
+                    metrics::counter!("chronicle_audio_chunks_uploaded").increment(1);
+                    metrics::counter!("chronicle_uploads_total", "type" => "chunk", "outcome" => "success").increment(1);
                     info!(pseudo_id = %chunk.pseudo_id, size = size, ssrc = ssrc, upload_secs = elapsed, "final_chunk_uploaded");
                 }
                 Err(e) => {
-                    metrics::counter!("ttrpg_uploads_total", "type" => "chunk", "outcome" => "failure").increment(1);
+                    metrics::counter!("chronicle_uploads_total", "type" => "chunk", "outcome" => "failure").increment(1);
                     tracing::error!(pseudo_id = %chunk.pseudo_id, error = %e, "final_chunk_upload_failed");
                 }
             }
@@ -393,13 +393,13 @@ fn process_packet(
             match api_clone.upload_chunk(session_id, &pseudo_id, chunk.data).await {
                 Ok(_) => {
                     let elapsed = upload_start.elapsed().as_secs_f64();
-                    metrics::histogram!("ttrpg_audio_chunk_upload_seconds").record(elapsed);
-                    metrics::counter!("ttrpg_audio_chunks_uploaded").increment(1);
-                    metrics::counter!("ttrpg_uploads_total", "type" => "chunk", "outcome" => "success").increment(1);
+                    metrics::histogram!("chronicle_audio_chunk_upload_seconds").record(elapsed);
+                    metrics::counter!("chronicle_audio_chunks_uploaded").increment(1);
+                    metrics::counter!("chronicle_uploads_total", "type" => "chunk", "outcome" => "success").increment(1);
                     info!(pseudo_id = %pseudo_id, size = size, upload_secs = elapsed, "chunk_uploaded");
                 }
                 Err(e) => {
-                    metrics::counter!("ttrpg_uploads_total", "type" => "chunk", "outcome" => "failure").increment(1);
+                    metrics::counter!("chronicle_uploads_total", "type" => "chunk", "outcome" => "failure").increment(1);
                     tracing::error!(pseudo_id = %pseudo_id, error = %e, "chunk_upload_failed");
                 }
             }

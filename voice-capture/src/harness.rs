@@ -3,7 +3,7 @@
 //! Lets an external test runner (curl, an ssh script, a future CI binary)
 //! drive the collector end-to-end without a Discord client — no slash
 //! commands, no consent-button clicks, no human in the loop. Pairs with
-//! the `ttrpg-collector-feeder` fleet: the runner sends the feeders to a
+//! the `chronicle-feeder` fleet: the runner sends the feeders to a
 //! voice channel via their control API, POSTs here to start recording,
 //! drives the feeders to play their WAVs, then POSTs here again to stop.
 //!

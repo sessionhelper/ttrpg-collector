@@ -66,7 +66,7 @@ pub async fn handle_consent_button(
         ConsentScope::Full => "full",
         ConsentScope::Decline => "decline",
     };
-    metrics::counter!("ttrpg_consent_responses_total", "scope" => scope_label).increment(1);
+    metrics::counter!("chronicle_consent_responses_total", "scope" => scope_label).increment(1);
 
     let outcome = match record_click(ctx, component, state, scope).await? {
         Some(o) => o,
@@ -341,7 +341,7 @@ pub(crate) async fn start_recording_headless(
         StartupStep::Aborted => return HeadlessStartOutcome::Preempted,
         StartupStep::VoiceJoinFailed(e) => {
             error!(error = %e, "voice_join_failed (headless)");
-            metrics::counter!("ttrpg_sessions_total", "outcome" => "failed").increment(1);
+            metrics::counter!("chronicle_sessions_total", "outcome" => "failed").increment(1);
             let mut sessions = state.sessions.lock().await;
             sessions.remove(guild_id);
             return HeadlessStartOutcome::VoiceJoinFailed(e.to_string());
@@ -392,7 +392,7 @@ pub(crate) async fn start_recording_headless(
         error!("API call failed (update_session_state, headless): {e}");
     }
 
-    metrics::gauge!("ttrpg_sessions_active").increment(1.0);
+    metrics::gauge!("chronicle_sessions_active").increment(1.0);
     info!(session_id = %session_id, "recording_started (headless)");
 
     // Spawn DAVE heal monitor — runs for the lifetime of the session.
@@ -438,7 +438,7 @@ async fn start_recording_pipeline(
         StartupStep::Aborted => return Ok(()),
         StartupStep::VoiceJoinFailed(e) => {
             error!(error = %e, "voice_join_failed");
-            metrics::counter!("ttrpg_sessions_total", "outcome" => "failed").increment(1);
+            metrics::counter!("chronicle_sessions_total", "outcome" => "failed").increment(1);
             component
                 .channel_id
                 .say(&ctx.http, "Failed to join voice channel.")
@@ -504,7 +504,7 @@ async fn start_recording_pipeline(
         error!("API call failed (update_session_state): {e}");
     }
 
-    metrics::gauge!("ttrpg_sessions_active").increment(1.0);
+    metrics::gauge!("chronicle_sessions_active").increment(1.0);
     info!(session_id = %session_id, "recording_started");
 
     // Spawn DAVE heal monitor — plays the start announcement once stable.
@@ -634,12 +634,12 @@ async fn wait_for_dave(
                 "dave_connection_confirmed — ssrc mapped, awaiting speech"
             };
             info!(attempt = attempt, dave_secs = dave_elapsed, "{msg}");
-            metrics::counter!("ttrpg_dave_attempts_total", "outcome" => "success").increment(1);
+            metrics::counter!("chronicle_dave_attempts_total", "outcome" => "success").increment(1);
             return DaveOutcome::Confirmed;
         }
 
         if attempt == MAX_ATTEMPTS {
-            metrics::counter!("ttrpg_dave_attempts_total", "outcome" => "failure").increment(1);
+            metrics::counter!("chronicle_dave_attempts_total", "outcome" => "failure").increment(1);
             warn!("dave_failed — no audio or ssrc after {MAX_ATTEMPTS} attempts");
             return DaveOutcome::Failed;
         }
@@ -1159,7 +1159,7 @@ async fn handle_quorum_failure(
     state: &AppState,
     guild_id: u64,
 ) -> Result<(), serenity::Error> {
-    metrics::counter!("ttrpg_sessions_total", "outcome" => "cancelled").increment(1);
+    metrics::counter!("chronicle_sessions_total", "outcome" => "cancelled").increment(1);
     {
         let mut sessions = state.sessions.lock().await;
         sessions.remove(guild_id);

@@ -162,16 +162,16 @@ async fn stop_recording(
     if let Ok(sid) = uuid::Uuid::parse_str(session_id) {
         match state.api.write_metadata(sid, meta_value, consent_value).await {
             Ok(_) => {
-                metrics::counter!("ttrpg_uploads_total", "type" => "metadata", "outcome" => "success").increment(1);
+                metrics::counter!("chronicle_uploads_total", "type" => "metadata", "outcome" => "success").increment(1);
             }
             Err(e) => {
                 error!(error = %e, "metadata_upload_failed");
-                metrics::counter!("ttrpg_uploads_total", "type" => "metadata", "outcome" => "failure").increment(1);
+                metrics::counter!("chronicle_uploads_total", "type" => "metadata", "outcome" => "failure").increment(1);
             }
         }
     }
 
-    metrics::gauge!("ttrpg_sessions_active").decrement(1.0);
+    metrics::gauge!("chronicle_sessions_active").decrement(1.0);
     info!(session_id = %session_id, "session_finalized");
 
     if let Ok(sid) = uuid::Uuid::parse_str(session_id)

@@ -58,7 +58,7 @@ pub async fn handle_record(
     // share the channel. The sole exception is the E2E harness bypass list:
     // Discord user IDs in `BYPASS_CONSENT_USER_IDS` are treated as
     // recordable even though they're flagged `user.bot = true`, so the
-    // feeder fleet (Moe/Larry/Curly/Gygax) in `ttrpg-collector-feeder` can
+    // feeder fleet (Moe/Larry/Curly/Gygax) in `chronicle-feeder` can
     // participate in test sessions. Prod leaves the bypass list empty.
     let bypass_ids = state.config.bypass_consent_user_ids();
     let members: Vec<(UserId, String)> = guild
@@ -330,7 +330,7 @@ pub async fn handle_record(
         .await
     {
         Ok(msg) => {
-            metrics::counter!("ttrpg_sessions_total", "outcome" => "started").increment(1);
+            metrics::counter!("chronicle_sessions_total", "outcome" => "started").increment(1);
             let mut sessions = state.sessions.lock().await;
             if let Some(s) = sessions.get_mut(guild_id.get()) {
                 s.consent_message = Some((msg.channel_id, msg.id));

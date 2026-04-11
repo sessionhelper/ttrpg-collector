@@ -13,7 +13,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/ttrpg-collector /usr/local/bin/ttrpg-collector
+COPY --from=builder /app/target/release/chronicle-bot /usr/local/bin/chronicle-bot
 COPY voice-capture/assets/ /assets/
 
-CMD ["ttrpg-collector"]
+CMD ["chronicle-bot"]
