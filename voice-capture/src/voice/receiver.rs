@@ -340,24 +340,39 @@ async fn buffer_task(
         }
     }
 
-    // Flush all remaining speaker buffers
+    // Flush all remaining speaker buffers. Uses the retry wrapper so a
+    // transient data-api blip during /stop doesn't drop the final chunk
+    // of each speaker. This path runs inline (not spawned) because the
+    // buffer_task's JoinHandle is what AudioHandle::shutdown() awaits;
+    // callers expect the task to return only when every flush attempt
+    // has completed.
     metrics::gauge!("chronicle_audio_bytes_buffered").set(0.0);
     info!(speakers = buffers.len(), "flushing_audio_buffers");
     for (ssrc, buffer) in buffers.iter_mut() {
         if let Some(chunk) = buffer.flush() {
             let size = chunk.data.len();
+            let seq = chunk.seq;
             let upload_start = std::time::Instant::now();
-            match api.upload_chunk(session_id, &chunk.pseudo_id, chunk.data).await {
+            match api
+                .upload_chunk_with_retry(session_id, &chunk.pseudo_id, chunk.data)
+                .await
+            {
                 Ok(_) => {
                     let elapsed = upload_start.elapsed().as_secs_f64();
                     metrics::histogram!("chronicle_audio_chunk_upload_seconds").record(elapsed);
                     metrics::counter!("chronicle_audio_chunks_uploaded").increment(1);
                     metrics::counter!("chronicle_uploads_total", "type" => "chunk", "outcome" => "success").increment(1);
-                    info!(pseudo_id = %chunk.pseudo_id, size = size, ssrc = ssrc, upload_secs = elapsed, "final_chunk_uploaded");
+                    info!(pseudo_id = %chunk.pseudo_id, size = size, ssrc = ssrc, seq = seq, upload_secs = elapsed, "final_chunk_uploaded");
                 }
                 Err(e) => {
                     metrics::counter!("chronicle_uploads_total", "type" => "chunk", "outcome" => "failure").increment(1);
-                    tracing::error!(pseudo_id = %chunk.pseudo_id, error = %e, "final_chunk_upload_failed");
+                    tracing::error!(
+                        pseudo_id = %chunk.pseudo_id,
+                        seq = seq,
+                        ssrc = ssrc,
+                        error = %e,
+                        "final_chunk_upload_lost"
+                    );
                 }
             }
         }
@@ -386,21 +401,40 @@ fn process_packet(
 
     if let Some(chunk) = buffer.write(bytes) {
         let size = chunk.data.len();
+        let seq = chunk.seq;
         let api_clone = api.clone();
         let pseudo_id = chunk.pseudo_id.clone();
+        // Spawn so the buffer task keeps draining `rx` while this chunk's
+        // retry loop may sleep for 1s/2s/4s backoff. Blocking here would
+        // back-pressure the mpsc::Receiver and eventually drop packets in
+        // the VoiceTick hot path — worse than the transient failure we're
+        // retrying around.
         tokio::spawn(async move {
             let upload_start = std::time::Instant::now();
-            match api_clone.upload_chunk(session_id, &pseudo_id, chunk.data).await {
+            match api_clone
+                .upload_chunk_with_retry(session_id, &pseudo_id, chunk.data)
+                .await
+            {
                 Ok(_) => {
                     let elapsed = upload_start.elapsed().as_secs_f64();
                     metrics::histogram!("chronicle_audio_chunk_upload_seconds").record(elapsed);
                     metrics::counter!("chronicle_audio_chunks_uploaded").increment(1);
                     metrics::counter!("chronicle_uploads_total", "type" => "chunk", "outcome" => "success").increment(1);
-                    info!(pseudo_id = %pseudo_id, size = size, upload_secs = elapsed, "chunk_uploaded");
+                    info!(pseudo_id = %pseudo_id, size = size, seq = seq, upload_secs = elapsed, "chunk_uploaded");
                 }
                 Err(e) => {
                     metrics::counter!("chronicle_uploads_total", "type" => "chunk", "outcome" => "failure").increment(1);
-                    tracing::error!(pseudo_id = %pseudo_id, error = %e, "chunk_upload_failed");
+                    // All 3 retries failed — the chunk is lost, but the
+                    // recording continues for other speakers and the
+                    // next chunk for this speaker will be attempted
+                    // independently. Log pseudo_id + seq so a future
+                    // reconciliation tool can identify the gap.
+                    tracing::error!(
+                        pseudo_id = %pseudo_id,
+                        seq = seq,
+                        error = %e,
+                        "chunk_upload_lost"
+                    );
                 }
             }
         });

@@ -3,9 +3,12 @@
 //! Replaces direct Postgres + S3 access. Every persistence operation
 //! goes through the Data API as an HTTP call.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::storage::pseudonymize;
@@ -132,7 +135,16 @@ struct AuthRequest {
 pub struct DataApiClient {
     client: reqwest::Client,
     base_url: String,
-    session_token: String,
+    /// Bearer token; wrapped in RwLock so `re_authenticate` can swap it
+    /// out atomically while in-flight requests on other tasks read it.
+    session_token: RwLock<String>,
+    /// Stored for re-authentication on 401. The collector holds the
+    /// shared secret in memory for the life of the process; re-auth
+    /// happens lazily when an upload returns 401 (token expired/reaped).
+    shared_secret: String,
+    /// Service name used when reauthenticating. Matches the original
+    /// value passed to `authenticate()`.
+    service_name: String,
 }
 
 /// Errors from Data API calls.
@@ -167,7 +179,26 @@ impl DataApiClient {
         service_name: &str,
     ) -> Result<Self, ApiError> {
         let client = reqwest::Client::new();
+        let token = Self::do_auth(&client, base_url, shared_secret, service_name).await?;
 
+        Ok(Self {
+            client,
+            base_url: base_url.to_string(),
+            session_token: RwLock::new(token),
+            shared_secret: shared_secret.to_string(),
+            service_name: service_name.to_string(),
+        })
+    }
+
+    /// Perform the auth handshake and return the session token. Shared
+    /// between `authenticate()` (initial login) and `re_authenticate()`
+    /// (token refresh after a 401).
+    async fn do_auth(
+        client: &reqwest::Client,
+        base_url: &str,
+        shared_secret: &str,
+        service_name: &str,
+    ) -> Result<String, ApiError> {
         let resp = client
             .post(format!("{base_url}/internal/auth"))
             .json(&AuthRequest {
@@ -178,16 +209,23 @@ impl DataApiClient {
             .await?;
 
         let auth: AuthResponse = check_status(resp).await?.json().await?;
-
-        Ok(Self {
-            client,
-            base_url: base_url.to_string(),
-            session_token: auth.session_token,
-        })
+        Ok(auth.session_token)
     }
 
-    fn auth_header(&self) -> String {
-        format!("Bearer {}", self.session_token)
+    /// Re-authenticate with the Data API, replacing the stored session
+    /// token. Called by `upload_chunk_with_retry` when an upload returns
+    /// 401 (token expired or reaped after >90s heartbeat silence).
+    pub async fn re_authenticate(&self) -> Result<(), ApiError> {
+        let token =
+            Self::do_auth(&self.client, &self.base_url, &self.shared_secret, &self.service_name)
+                .await?;
+        *self.session_token.write().await = token;
+        info!(service = %self.service_name, "re_authenticated_with_data_api");
+        Ok(())
+    }
+
+    async fn auth_header(&self) -> String {
+        format!("Bearer {}", self.session_token.read().await)
     }
 
     // --- Heartbeat ---
@@ -197,7 +235,7 @@ impl DataApiClient {
         let resp = self
             .client
             .post(format!("{}/internal/heartbeat", self.base_url))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .send()
             .await?;
         check_status(resp).await?;
@@ -219,7 +257,7 @@ impl DataApiClient {
         let resp = self
             .client
             .post(format!("{}/internal/sessions", self.base_url))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&CreateSessionRequest {
                 id,
                 guild_id,
@@ -242,7 +280,7 @@ impl DataApiClient {
         let resp = self
             .client
             .patch(format!("{}/internal/sessions/{}", self.base_url, session_id))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&UpdateSessionRequest {
                 status: Some(status.to_string()),
                 ended_at: None,
@@ -263,7 +301,7 @@ impl DataApiClient {
         let resp = self
             .client
             .patch(format!("{}/internal/sessions/{}", self.base_url, session_id))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&UpdateSessionRequest {
                 status: Some("abandoned".to_string()),
                 ended_at: Some(Utc::now()),
@@ -295,7 +333,7 @@ impl DataApiClient {
         let resp = self
             .client
             .patch(format!("{}/internal/sessions/{}", self.base_url, session_id))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&UpdateSessionRequest {
                 ended_at: Some(ended_at),
                 participant_count: Some(participant_count),
@@ -316,7 +354,7 @@ impl DataApiClient {
         let resp = self
             .client
             .post(format!("{}/internal/users", self.base_url))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&CreateUserRequest {
                 discord_id_hash: pseudo_id.clone(),
                 pseudo_id,
@@ -374,7 +412,7 @@ impl DataApiClient {
                 "{}/internal/sessions/{}/participants",
                 self.base_url, session_id
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&AddParticipantRequest {
                 user_id: Some(user.id),
                 mid_session_join: Some(mid_session_join),
@@ -413,7 +451,7 @@ impl DataApiClient {
                 "{}/internal/sessions/{}/participants/batch",
                 self.base_url, session_id
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&BatchAddParticipantsRequest {
                 participants: requests,
             })
@@ -449,7 +487,7 @@ impl DataApiClient {
                 "{}/internal/participants/{}/consent",
                 self.base_url, participant_id
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&UpdateConsentRequest {
                 consent_scope: Some(scope.to_string()),
                 consented_at: Some(Utc::now()),
@@ -502,7 +540,7 @@ impl DataApiClient {
                 "{}/internal/participants/{}/license",
                 self.base_url, participant_id
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&UpdateLicenseRequest {
                 no_llm_training: no_llm,
                 no_public_release: no_public,
@@ -524,7 +562,7 @@ impl DataApiClient {
                 "{}/internal/sessions/{}/participants",
                 self.base_url, session_id
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .send()
             .await?;
         Ok(check_status(resp).await?.json().await?)
@@ -533,7 +571,13 @@ impl DataApiClient {
     // --- Audio ---
 
     /// Upload a PCM audio chunk (replaces s3.upload_bytes for audio).
-    /// Sends raw bytes as the request body.
+    /// Sends raw bytes as the request body. Single-attempt — prefer
+    /// [`upload_chunk_with_retry`] for live-recording code paths where
+    /// a transient data-api blip must not drop audio (R7). Kept on the
+    /// public surface as the underlying primitive; currently unused by
+    /// production code, but useful for tests and for ad-hoc callers
+    /// that need single-attempt semantics.
+    #[allow(dead_code)]
     pub async fn upload_chunk(
         &self,
         session_id: Uuid,
@@ -541,43 +585,174 @@ impl DataApiClient {
         data: Vec<u8>,
     ) -> Result<(), ApiError> {
         let size = data.len();
-        for attempt in 1..=3 {
-            let resp = self
+        let resp = self
+            .client
+            .post(format!(
+                "{}/internal/sessions/{}/audio/{}/chunk",
+                self.base_url, session_id, pseudo_id
+            ))
+            .header("authorization", self.auth_header().await)
+            .header("content-type", "application/octet-stream")
+            .body(data)
+            .send()
+            .await?;
+        check_status(resp).await?;
+        info!(session_id = %session_id, pseudo_id = %pseudo_id, size = size, "chunk_uploaded");
+        Ok(())
+    }
+
+    /// Upload a PCM audio chunk with retry on transient errors (R7).
+    ///
+    /// Retry policy, mirroring `ovp-worker::api_client::download_chunk_with_retry`:
+    /// - **5xx** (server error) or network error: retry up to 3 times with
+    ///   1s / 2s / 4s backoff.
+    /// - **401** (unauthorized): re-authenticate once, then retry. The
+    ///   collector's token is reaped by the Data API after 90s of
+    ///   heartbeat silence, so this path fires on the first upload after
+    ///   a heartbeat interruption.
+    /// - **4xx** (other client errors): fail immediately — retrying a
+    ///   400/413/etc. will not resolve the underlying problem.
+    ///
+    /// On success returns `Ok(())`. On final failure (all 3 attempts
+    /// exhausted, or a non-retryable 4xx) returns the last error seen
+    /// so the caller can log it and mark the chunk as lost.
+    pub async fn upload_chunk_with_retry(
+        &self,
+        session_id: Uuid,
+        pseudo_id: &str,
+        data: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        const MAX_RETRIES: u32 = 3;
+        let backoff_durations = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+        ];
+        let size = data.len();
+        let url = format!(
+            "{}/internal/sessions/{}/audio/{}/chunk",
+            self.base_url, session_id, pseudo_id
+        );
+
+        // Track whether we've already burned our one 401 re-auth retry.
+        // Two 401s in a row means re-auth silently failed to fix the
+        // token (e.g. shared_secret rotated out from under us) — bail
+        // instead of spinning forever.
+        let mut reauth_attempted = false;
+        let mut attempt: u32 = 0;
+
+        loop {
+            attempt += 1;
+            let send_result = self
                 .client
-                .post(format!(
-                    "{}/internal/sessions/{}/audio/{}/chunk",
-                    self.base_url, session_id, pseudo_id
-                ))
-                .header("authorization", self.auth_header())
+                .post(&url)
+                .header("authorization", self.auth_header().await)
                 .header("content-type", "application/octet-stream")
                 .body(data.clone())
                 .send()
                 .await;
 
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    info!(session_id = %session_id, pseudo_id = %pseudo_id, size = size, attempt = attempt, "chunk_uploaded");
+            match send_result {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(
+                        session_id = %session_id,
+                        pseudo_id = %pseudo_id,
+                        size = size,
+                        attempt = attempt,
+                        "chunk_uploaded"
+                    );
                     return Ok(());
                 }
-                Ok(r) => {
-                    let status = r.status().as_u16();
-                    let body = r.text().await.unwrap_or_default();
-                    if attempt == 3 {
-                        error!(session_id = %session_id, pseudo_id = %pseudo_id, status = status, "chunk_upload_failed");
-                        return Err(ApiError::Status { status, body });
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+
+                    // 401 — re-auth once and retry immediately (no backoff).
+                    if status == 401 && !reauth_attempted {
+                        reauth_attempted = true;
+                        warn!(
+                            session_id = %session_id,
+                            pseudo_id = %pseudo_id,
+                            attempt = attempt,
+                            "chunk_upload_got_401_re_authenticating"
+                        );
+                        // Drop the 401 response body before re-auth.
+                        let _ = resp.text().await;
+                        if let Err(e) = self.re_authenticate().await {
+                            error!(
+                                session_id = %session_id,
+                                pseudo_id = %pseudo_id,
+                                error = %e,
+                                "chunk_upload_re_auth_failed"
+                            );
+                            return Err(e);
+                        }
+                        // Don't count the 401 against the 5xx retry budget.
+                        attempt -= 1;
+                        continue;
                     }
+
+                    // 5xx — transient, retry with backoff.
+                    if status >= 500 {
+                        let body = resp.text().await.unwrap_or_default();
+                        if attempt >= MAX_RETRIES {
+                            error!(
+                                session_id = %session_id,
+                                pseudo_id = %pseudo_id,
+                                status = status,
+                                attempts = attempt,
+                                "chunk_upload_failed_after_retries"
+                            );
+                            return Err(ApiError::Status { status, body });
+                        }
+                        let delay = backoff_durations[(attempt - 1) as usize];
+                        warn!(
+                            session_id = %session_id,
+                            pseudo_id = %pseudo_id,
+                            status = status,
+                            attempt = attempt,
+                            delay_ms = delay.as_millis() as u64,
+                            "chunk_upload_retrying_after_5xx"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    // 4xx (including a repeat 401 after re-auth) — fail fast.
+                    let body = resp.text().await.unwrap_or_default();
+                    error!(
+                        session_id = %session_id,
+                        pseudo_id = %pseudo_id,
+                        status = status,
+                        "chunk_upload_failed_client_error"
+                    );
+                    return Err(ApiError::Status { status, body });
                 }
                 Err(e) => {
-                    if attempt == 3 {
-                        error!(session_id = %session_id, pseudo_id = %pseudo_id, error = %e, "chunk_upload_failed");
+                    // Network / connection error — treated like 5xx.
+                    if attempt >= MAX_RETRIES {
+                        error!(
+                            session_id = %session_id,
+                            pseudo_id = %pseudo_id,
+                            error = %e,
+                            attempts = attempt,
+                            "chunk_upload_failed_after_retries"
+                        );
                         return Err(ApiError::Http(e));
                     }
+                    let delay = backoff_durations[(attempt - 1) as usize];
+                    warn!(
+                        session_id = %session_id,
+                        pseudo_id = %pseudo_id,
+                        error = %e,
+                        attempt = attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "chunk_upload_retrying_after_network_error"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
                 }
             }
-            let backoff = std::time::Duration::from_secs(1 << (attempt - 1));
-            tokio::time::sleep(backoff).await;
         }
-        Ok(())
     }
 
     // --- Metadata ---
@@ -603,7 +778,7 @@ impl DataApiClient {
                 "{}/internal/sessions/{}/metadata",
                 self.base_url, session_id
             ))
-            .header("authorization", self.auth_header())
+            .header("authorization", self.auth_header().await)
             .json(&body)
             .send()
             .await?;
