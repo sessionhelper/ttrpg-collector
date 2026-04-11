@@ -21,7 +21,7 @@ fi
 : "${S3_ENDPOINT:?Set S3_ENDPOINT}"
 : "${S3_ACCESS_KEY:?Set S3_ACCESS_KEY}"
 : "${S3_SECRET_KEY:?Set S3_SECRET_KEY}"
-: "${S3_BUCKET:=ttrpg-dataset-raw}"
+: "${S3_BUCKET:=ovp-dataset-raw}"
 
 export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"

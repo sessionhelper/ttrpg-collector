@@ -18,14 +18,14 @@ done
 
 # Create test bucket in MinIO (ignore error if already exists)
 echo "Creating test bucket in MinIO..."
-aws --endpoint-url http://localhost:9000 s3 mb s3://ttrpg-dataset-test 2>/dev/null || true
+aws --endpoint-url http://localhost:9000 s3 mb s3://ovp-dataset-test 2>/dev/null || true
 
 echo "Running tests..."
 cd "$PROJECT_DIR/voice-capture"
 DATABASE_URL=postgres://ttrpg:test@localhost:5433/ttrpg_test \
 S3_ACCESS_KEY=minioadmin \
 S3_SECRET_KEY=minioadmin \
-S3_BUCKET=ttrpg-dataset-test \
+S3_BUCKET=ovp-dataset-test \
 S3_ENDPOINT=http://localhost:9000 \
 cargo test -- --test-threads=1
 
