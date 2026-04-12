@@ -248,20 +248,40 @@ impl VoiceEventHandler for AudioReceiver {
                 // Signal DAVE is working as soon as we see ANY decoded
                 // audio — regardless of whether the SSRC is mapped to a
                 // known user. DAVE confirmation and SSRC→user resolution
-                // are independent subsystems; coupling them caused
-                // wait_for_dave to fail in bot-only channels where
-                // SpeakingStateUpdate (OP5) never fires to populate the
-                // ssrc_map. See v0.5.7 commit message for the full
-                // investigation.
+                // are independent subsystems.
                 if data.decoded_voice.is_some() {
                     self.audio_received
                         .store(true, std::sync::atomic::Ordering::Relaxed);
+
+                    // Record that this SSRC has delivered decoded audio,
+                    // even if it's not yet mapped to a user via OP5.
+                    //
+                    // This is critical: OP5 (SpeakingStateUpdate) is
+                    // edge-triggered and only fires when a user TRANSITIONS
+                    // to speaking. If a user is already in the channel when
+                    // the bot joins, OP5 never fires, ssrc_to_user stays
+                    // empty, and the old code would never count the SSRC
+                    // as "seen" — making the bot think DAVE was deaf when
+                    // it was actually decrypting fine.
+                    //
+                    // By counting ALL decoded SSRCs here (before the
+                    // mapping check), the audio-gated-stable logic can
+                    // detect "audio is flowing" without waiting for OP5.
+                    // The SSRC won't be CAPTURED (buffered + uploaded)
+                    // until OP5 maps it, but the heal system won't
+                    // misdiagnose a working connection as dead.
+                    {
+                        let mut seen = self.ssrcs_seen.lock().expect("ssrcs_seen poisoned");
+                        seen.insert(*ssrc);
+                    }
                 }
 
                 // Only capture (buffer + upload) audio for consented users
                 // whose SSRC has been resolved to a Discord user ID via
-                // SpeakingStateUpdate. Unmapped SSRCs are silently skipped
-                // — their audio is "seen" by DAVE but not persisted.
+                // SpeakingStateUpdate. Unmapped SSRCs are still skipped
+                // for capture — their audio is "seen" by the heal system
+                // but not persisted. Once OP5 fires (typically <200ms
+                // after the user starts speaking), capture begins.
                 let user_id = match ssrc_map.get(ssrc) {
                     Some(uid) if consented.contains(uid) => *uid,
                     _ => continue,
@@ -269,14 +289,6 @@ impl VoiceEventHandler for AudioReceiver {
 
                 if let Some(decoded) = &data.decoded_voice {
                     metrics::counter!("chronicle_audio_packets_received").increment(1);
-
-                    // Record that this SSRC has delivered decoded audio.
-                    // The DAVE heal task checks this set to confirm that
-                    // OP5-announced speakers are actually being decoded.
-                    {
-                        let mut seen = self.ssrcs_seen.lock().expect("ssrcs_seen poisoned");
-                        seen.insert(*ssrc);
-                    }
 
                     // Send to buffer task via channel — no lock contention
                     let _ = self.tx.try_send(AudioPacket {

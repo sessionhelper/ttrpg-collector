@@ -908,38 +908,33 @@ fn spawn_dave_heal_task(
         }
 
         // Fallback: OP5 is edge-triggered. If speakers were already
-        // transmitting when the collector joined, OP5 never fires and the
-        // check above passes vacuously. Detect this by comparing ssrc_map
-        // against ssrcs_seen: if VoiceTick is delivering SSRCs that OP5
-        // never mapped, the edge-trigger was missed and DAVE is likely broken.
+        // transmitting when the collector joined, OP5 never fires for
+        // them. Previously this code compared ssrcs_seen against
+        // ssrc_map and healed if mapped < consented. That was wrong:
         //
-        // If seen=0 AND mapped=0, nobody is transmitting — that's normal
-        // (e.g. feeders waiting for the stable signal, or players not
-        // talking yet). Do NOT heal in this case.
+        // - OP5 only fires on a speaking TRANSITION. Idle speakers in
+        //   the channel generate VoiceTick data (comfort noise) but
+        //   never trigger OP5, so mapped stays at 0 indefinitely.
+        // - ssrcs_seen now counts ALL decoded SSRCs (even unmapped),
+        //   so seen > 0 just means "VoiceTick is delivering audio"
+        //   not "someone is actively speaking and OP5 should have fired."
+        //
+        // The correct logic: only heal if OP5 explicitly announced an
+        // SSRC (via the broken_ssrcs drain above) that VoiceTick can't
+        // deliver. The "seen > 0 but mapped < consented" case is normal
+        // for idle channels and does NOT require a heal. The audio-gated
+        // stable check and continuous monitoring handle the rest.
         let needs_heal = if !broken_ssrcs.is_empty() {
             true
         } else {
             let mapped = ssrc_map.lock().expect("ssrc_map poisoned").len();
             let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
-            let consented_count = consented_users.lock().await.len();
-            if seen > 0 && mapped < consented_count {
-                // SSRCs in VoiceTick but not all mapped via OP5 — edge-trigger
-                // missed, DAVE decryption likely broken for unmapped speakers.
-                warn!(
-                    session_id = %session_id,
-                    mapped, seen, consented = consented_count,
-                    "dave_heal_triggered — SSRCs seen but only {} of {} mapped",
-                    mapped, consented_count,
-                );
-                true
-            } else {
-                info!(
-                    session_id = %session_id,
-                    mapped, seen,
-                    "dave_heal_initial_check_passed"
-                );
-                false
-            }
+            info!(
+                session_id = %session_id,
+                mapped, seen,
+                "dave_heal_initial_check_passed"
+            );
+            false
         };
 
         if needs_heal {
