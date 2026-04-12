@@ -843,16 +843,16 @@ fn spawn_dave_heal_task(
                 return;
             };
             let stable = s.recording_stable.clone();
-            match &mut s.phase {
-                Phase::Recording(data) | Phase::StartingRecording(data) => {
-                    let rx = data.op5_rx.take();
-                    let seen = data.ssrcs_seen.clone();
-                    let map = data.ssrc_map.clone();
-                    let cu = data.consented_users.clone();
-                    (rx, seen, map, cu, stable)
-                }
-                _ => return,
-            }
+            let (Phase::Recording(data) | Phase::StartingRecording(data)) = &mut s.phase else {
+                return;
+            };
+            (
+                data.op5_rx.take(),
+                data.ssrcs_seen.clone(),
+                data.ssrc_map.clone(),
+                data.consented_users.clone(),
+                stable,
+            )
         };
 
         let Some(ref mut op5_rx) = op5_rx else {
@@ -866,7 +866,7 @@ fn spawn_dave_heal_task(
         // Grace period: let MLS group stabilize after collector joins.
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Drain buffered OP5 events, check each against ssrcs_seen
+        // Drain buffered OP5 events, check each against ssrcs_seen.
         let mut broken_ssrcs: Vec<(u32, u64)> = Vec::new();
         while let Ok(evt) = op5_rx.try_recv() {
             let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
@@ -875,14 +875,14 @@ fn spawn_dave_heal_task(
             }
         }
 
-        // Give broken speakers 2s more to appear
+        // Give broken speakers 2s more to appear.
         if !broken_ssrcs.is_empty() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
             broken_ssrcs.retain(|(ssrc, _)| !seen.contains(ssrc));
         }
 
-        // Wait up to 10s for late OP5 arrivals
+        // Wait up to 10s for late OP5 arrivals.
         if broken_ssrcs.is_empty() {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
@@ -894,7 +894,8 @@ fn spawn_dave_heal_task(
                     Ok(Some(evt)) => {
                         tokio::time::sleep(Duration::from_secs(2).min(
                             deadline.saturating_duration_since(tokio::time::Instant::now()),
-                        )).await;
+                        ))
+                        .await;
                         let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
                         if !seen.contains(&evt.ssrc) {
                             broken_ssrcs.push((evt.ssrc, evt.user_id));
@@ -907,26 +908,22 @@ fn spawn_dave_heal_task(
             }
         }
 
-        // Fallback: OP5 is edge-triggered. If speakers were already
-        // transmitting when the collector joined, OP5 never fires for
-        // them. Previously this code compared ssrcs_seen against
-        // ssrc_map and healed if mapped < consented. That was wrong:
+        // OP5 is edge-triggered. If speakers were already transmitting when
+        // the collector joined, OP5 never fires for them.
         //
-        // - OP5 only fires on a speaking TRANSITION. Idle speakers in
-        //   the channel generate VoiceTick data (comfort noise) but
-        //   never trigger OP5, so mapped stays at 0 indefinitely.
-        // - ssrcs_seen now counts ALL decoded SSRCs (even unmapped),
-        //   so seen > 0 just means "VoiceTick is delivering audio"
-        //   not "someone is actively speaking and OP5 should have fired."
+        // - OP5 only fires on a speaking TRANSITION. Idle speakers in the
+        //   channel generate VoiceTick data (comfort noise) but never
+        //   trigger OP5, so mapped stays at 0 indefinitely.
+        // - ssrcs_seen counts ALL decoded SSRCs (even unmapped), so
+        //   seen > 0 just means "VoiceTick is delivering audio" not
+        //   "someone is actively speaking and OP5 should have fired."
         //
-        // The correct logic: only heal if OP5 explicitly announced an
-        // SSRC (via the broken_ssrcs drain above) that VoiceTick can't
-        // deliver. The "seen > 0 but mapped < consented" case is normal
-        // for idle channels and does NOT require a heal. The audio-gated
-        // stable check and continuous monitoring handle the rest.
-        let needs_heal = if !broken_ssrcs.is_empty() {
-            true
-        } else {
+        // Only heal if OP5 explicitly announced an SSRC (via the
+        // broken_ssrcs drain above) that VoiceTick can't deliver. The
+        // "seen > 0 but mapped < consented" case is normal for idle
+        // channels and does NOT require a heal. The audio-gated stable
+        // check and continuous monitoring handle the rest.
+        if broken_ssrcs.is_empty() {
             let mapped = ssrc_map.lock().expect("ssrc_map poisoned").len();
             let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
             info!(
@@ -934,21 +931,17 @@ fn spawn_dave_heal_task(
                 mapped, seen,
                 "dave_heal_initial_check_passed"
             );
-            false
-        };
-
-        if needs_heal {
-            if !broken_ssrcs.is_empty() {
-                warn!(
-                    session_id = %session_id,
-                    broken = ?broken_ssrcs.iter().map(|(s, u)| format!("{}(uid={})", s, u)).collect::<Vec<_>>(),
-                    "dave_heal_triggered — OP5 fired but SSRC missing from VoiceTick"
-                );
-            }
+        } else {
+            warn!(
+                session_id = %session_id,
+                broken = ?broken_ssrcs.iter().map(|(s, u)| format!("{}(uid={})", s, u)).collect::<Vec<_>>(),
+                "dave_heal_triggered — OP5 fired but SSRC missing from VoiceTick"
+            );
             healed = do_heal(
                 &heal_sessions, &heal_manager, guild_id, guild_id_obj,
                 channel_id, &session_id,
-            ).await;
+            )
+            .await;
         }
 
         // --- Wait for proof of audio before declaring stable ---
@@ -959,8 +952,8 @@ fn spawn_dave_heal_task(
         // can actually hear them.
         //
         // If no SSRCs arrive within 5s, trigger a dead-connection heal
-        // and then set stable regardless — this breaks any deadlock
-        // where feeders are waiting for stable to play.
+        // and then set stable regardless — breaks any deadlock where
+        // feeders are waiting for stable to play.
         if !healed {
             let audio_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
@@ -977,7 +970,8 @@ fn spawn_dave_heal_task(
                     healed = do_heal(
                         &heal_sessions, &heal_manager, guild_id, guild_id_obj,
                         channel_id, &session_id,
-                    ).await;
+                    )
+                    .await;
 
                     let new_rx = {
                         let mut sessions = heal_sessions.lock().await;
@@ -996,8 +990,8 @@ fn spawn_dave_heal_task(
         }
 
         // Signal stable — either audio confirmed or heal completed.
-        // Play the start announcement NOW. This is the contract: the
-        // announcement means "recording is stable, you can talk."
+        // Play the start announcement NOW: the announcement means
+        // "recording is stable, you can talk."
         if !healed {
             play_start_announcement(&heal_manager, guild_id_obj).await;
         }
@@ -1006,17 +1000,11 @@ fn spawn_dave_heal_task(
         info!(session_id = %session_id, healed, "recording_stable");
 
         // --- Continuous monitoring ---
-        // Two detection paths run in parallel:
-        // 1. OP5 events: if a new OP5 fires and the SSRC doesn't appear
-        //    in VoiceTick within 2s, DAVE is broken.
-        // 2. Periodic fallback (every 5s): if ssrcs_seen has entries that
-        //    ssrc_map doesn't, OP5 was edge-triggered away and we missed it.
-        //    This catches the case where feeders were already in "speaking"
-        //    state before the collector joined.
         //
-        //    Was 10s; reduced to 5s to align with the dead-connection
-        //    threshold (also 5s). Discord sends ~50 packets/sec/speaker,
-        //    so 5s is more than enough time for real audio to arrive.
+        // Path 1 — OP5 events: new SSRC announced but missing from
+        //   VoiceTick after 10s → DAVE is broken.
+        // Path 2 — Periodic fallback (5s): unmapped SSRCs or zero
+        //   decoded audio → reconnect for mappings or dead-connection heal.
         let mut fallback_interval = tokio::time::interval(Duration::from_secs(5));
         fallback_interval.tick().await; // consume the immediate first tick
 
@@ -1028,12 +1016,8 @@ fn spawn_dave_heal_task(
                         return;
                     };
 
-                    // Already seen this SSRC? Skip.
-                    {
-                        let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
-                        if seen.contains(&evt.ssrc) {
-                            continue;
-                        }
+                    if ssrcs_seen.lock().expect("ssrcs_seen poisoned").contains(&evt.ssrc) {
+                        continue;
                     }
 
                     // New SSRC from OP5 — give 10s for VoiceTick to confirm.
@@ -1041,11 +1025,9 @@ fn spawn_dave_heal_task(
                     // 10 seconds during transitions. A 2s timer caused false
                     // heals during normal epoch renegotiations (e.g. human joins).
                     tokio::time::sleep(Duration::from_secs(10)).await;
-                    {
-                        let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
-                        if seen.contains(&evt.ssrc) {
-                            continue;
-                        }
+
+                    if ssrcs_seen.lock().expect("ssrcs_seen poisoned").contains(&evt.ssrc) {
+                        continue;
                     }
 
                     if healed {
@@ -1067,21 +1049,17 @@ fn spawn_dave_heal_task(
                         channel_id, &session_id,
                     ).await;
 
-                    // After heal, take the new op5_rx from the fresh Call
-                    let new_rx = {
+                    let Some(rx) = ({
                         let mut sessions = heal_sessions.lock().await;
                         sessions.get_mut(guild_id).and_then(|s| match &mut s.phase {
                             Phase::Recording(data) => data.op5_rx.take(),
                             _ => None,
                         })
+                    }) else {
+                        info!(session_id = %session_id, "dave_monitor_exit — no new op5_rx after heal");
+                        return;
                     };
-                    match new_rx {
-                        Some(rx) => *op5_rx = rx,
-                        None => {
-                            info!(session_id = %session_id, "dave_monitor_exit — no new op5_rx after heal");
-                            return;
-                        }
-                    }
+                    *op5_rx = rx;
                 }
 
                 _ = fallback_interval.tick() => {
@@ -1115,17 +1093,15 @@ fn spawn_dave_heal_task(
                             "reconnecting to acquire SSRC→user mappings (OP5 edge-trigger missed)"
                         );
                     } else if seen_count == 0 && mapped_count == 0 && secs_since_stable >= 5 {
-                        // 5s after stable, still no SSRCs at all. DAVE
-                        // connection is completely dead — no decoded audio,
-                        // no OP5, nothing. Force heal.
+                        // 5s after stable, still no SSRCs at all. DAVE connection
+                        // is completely dead — no decoded audio, no OP5, nothing.
                         //
                         // Was 30s; reduced to 5s because the initial DAVE
-                        // handshake frequently produces a session that
-                        // passes all checks but never delivers decoded
-                        // packets. 5s is long enough for real audio to
-                        // arrive (Discord sends ~50 packets/sec/speaker)
-                        // but short enough to avoid losing the first 30s
-                        // of a recording.
+                        // handshake frequently produces a session that passes
+                        // all checks but never delivers decoded packets. 5s is
+                        // long enough for real audio to arrive (Discord sends
+                        // ~50 packets/sec/speaker) but short enough to avoid
+                        // losing the first 30s of a recording.
                         warn!(
                             session_id = %session_id,
                             secs_since_stable,
@@ -1135,27 +1111,22 @@ fn spawn_dave_heal_task(
                         continue;
                     }
 
-                    {
-                        healed = do_heal(
-                            &heal_sessions, &heal_manager, guild_id, guild_id_obj,
-                            channel_id, &session_id,
-                        ).await;
+                    healed = do_heal(
+                        &heal_sessions, &heal_manager, guild_id, guild_id_obj,
+                        channel_id, &session_id,
+                    ).await;
 
-                        let new_rx = {
-                            let mut sessions = heal_sessions.lock().await;
-                            sessions.get_mut(guild_id).and_then(|s| match &mut s.phase {
-                                Phase::Recording(data) => data.op5_rx.take(),
-                                _ => None,
-                            })
-                        };
-                        match new_rx {
-                            Some(rx) => *op5_rx = rx,
-                            None => {
-                                info!(session_id = %session_id, "dave_monitor_exit — no new op5_rx after heal");
-                                return;
-                            }
-                        }
-                    }
+                    let Some(rx) = ({
+                        let mut sessions = heal_sessions.lock().await;
+                        sessions.get_mut(guild_id).and_then(|s| match &mut s.phase {
+                            Phase::Recording(data) => data.op5_rx.take(),
+                            _ => None,
+                        })
+                    }) else {
+                        info!(session_id = %session_id, "dave_monitor_exit — no new op5_rx after heal");
+                        return;
+                    };
+                    *op5_rx = rx;
                 }
             }
         }
