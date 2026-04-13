@@ -1,9 +1,8 @@
 //! Voice state change dispatch.
 //!
 //! Post-refactor: the actor owns mid-session-join and auto-stop logic.
-//! This module computes the tiny amount of cache data the actor needs
-//! (joining user's display name + bot flag) and forwards the event via
-//! `SessionCmd::VoiceStateChange`. No `state.sessions.lock()` here.
+//! This module computes the cache data the actor needs and forwards the event
+//! via `SessionCmd::VoiceStateChange`. No bypass, no `state.sessions.lock()`.
 
 use std::sync::Arc;
 
@@ -12,32 +11,27 @@ use serenity::all::*;
 use crate::session::actor::SessionCmd;
 use crate::state::AppState;
 
-/// Entry point called from `Handler::voice_state_update`.
 pub async fn handle_voice_state_update(
     ctx: Context,
     old: Option<VoiceState>,
     new: VoiceState,
     state: Arc<AppState>,
 ) {
-    let guild_id = match new.guild_id {
-        Some(id) => id,
-        None => return,
+    let Some(guild_id) = new.guild_id else { return };
+    let Some(entry) = state.sessions.get(&guild_id.get()) else {
+        return;
     };
-
-    let handle = match state.sessions.get(&guild_id.get()) {
-        Some(entry) if !entry.is_shutting_down() => entry.clone(),
-        _ => return,
-    };
+    if entry.is_shutting_down() {
+        return;
+    }
+    let handle = entry.clone();
 
     let guild = match ctx.cache.guild(guild_id) {
         Some(g) => g.clone(),
         None => return,
     };
 
-    let is_bot = guild
-        .members
-        .get(&new.user_id)
-        .is_some_and(|m| m.user.bot);
+    let is_bot = guild.members.get(&new.user_id).is_some_and(|m| m.user.bot);
     let display_name = guild
         .members
         .get(&new.user_id)

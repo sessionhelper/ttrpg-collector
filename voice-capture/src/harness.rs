@@ -1,11 +1,22 @@
-//! Dev-only E2E test harness HTTP endpoint.
+//! Dev-only E2E test harness HTTP surface.
 //!
-//! Post-refactor: the actor drives the recording lifecycle. The harness
-//! still exposes its HTTP surface but routes every action through
-//! `SessionCmd::*` on a `SessionHandle`. No `state.sessions.lock()` here.
+//! Every endpoint flows through the same `SessionCmd` actor surface as the
+//! Discord handlers. There is no "bypass" — the harness IS the bypass, and
+//! it exercises the real code path for enrolment, consent and license
+//! mutation rather than short-circuiting it.
+//!
+//! Endpoints:
+//!   - `GET  /health`         → `{ ready, harness_enabled }`
+//!   - `GET  /status?guild`   → current session snapshot
+//!   - `POST /record`         → spawn session
+//!   - `POST /enrol`          → add a participant
+//!   - `POST /consent`        → record consent
+//!   - `POST /license`        → PATCH license flag
+//!   - `POST /stop`           → stop + wait for finalize
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -13,17 +24,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serenity::all::*;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::session::actor::{
-    request, spawn_session, SessionCmd, StartRecordingOutcome,
+    request, spawn_session, LicenseField, SessionCmd, SessionSnapshot,
 };
-use crate::session::Session;
+use crate::session::{ConsentScope, Session};
 use crate::state::AppState;
-
-// ---------------------------------------------------------------------------
-// Request / response types
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Debug)]
 struct RecordRequest {
@@ -41,16 +48,44 @@ struct StopRequest {
     guild_id: u64,
 }
 
+#[derive(Deserialize, Debug)]
+struct EnrolRequest {
+    guild_id: u64,
+    user_id: u64,
+    display_name: String,
+    is_bot: bool,
+}
+
+#[derive(Serialize, Debug)]
+struct EnrolResponse {
+    participant_id: uuid::Uuid,
+}
+
+#[derive(Deserialize, Debug)]
+struct ConsentRequest {
+    guild_id: u64,
+    user_id: u64,
+    scope: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct LicenseRequest {
+    guild_id: u64,
+    user_id: u64,
+    field: String,
+    value: bool,
+}
+
 #[derive(Serialize, Debug)]
 struct OkResponse {
     ok: bool,
 }
 
 #[derive(Serialize, Debug)]
+#[cfg_attr(test, derive(Deserialize))]
 struct HealthResponse {
     ready: bool,
     harness_enabled: bool,
-    bypass_user_count: usize,
 }
 
 #[derive(Deserialize, Debug)]
@@ -63,6 +98,7 @@ struct StatusResponse {
     recording: bool,
     stable: bool,
     session_id: Option<String>,
+    phase: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -78,7 +114,6 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ready: state.ctx.get().is_some(),
         harness_enabled: state.config.harness_enabled,
-        bypass_user_count: state.config.bypass_consent_user_ids().len(),
     })
 }
 
@@ -86,27 +121,28 @@ async fn status(
     State(state): State<Arc<AppState>>,
     Query(q): Query<StatusQuery>,
 ) -> Json<StatusResponse> {
-    let handle = match state.sessions.get(&q.guild_id) {
-        Some(h) => h.clone(),
-        None => {
-            return Json(StatusResponse {
-                recording: false,
-                stable: false,
-                session_id: None,
-            });
-        }
+    let Some(handle) = state.sessions.get(&q.guild_id).map(|e| e.clone()) else {
+        return Json(StatusResponse {
+            recording: false,
+            stable: false,
+            session_id: None,
+            phase: None,
+        });
     };
-    let snapshot = request(&handle, |reply| SessionCmd::GetSnapshot { reply }).await;
-    match snapshot {
-        Ok(s) => Json(StatusResponse {
-            recording: s.recording,
-            stable: s.stable,
-            session_id: Some(s.session_id),
-        }),
+    match request(&handle, |reply| SessionCmd::GetSnapshot { reply }).await {
+        Ok(SessionSnapshot { recording, stable, session_id, phase_label, .. }) => {
+            Json(StatusResponse {
+                recording,
+                stable,
+                session_id: Some(session_id),
+                phase: Some(phase_label.to_string()),
+            })
+        }
         Err(_) => Json(StatusResponse {
             recording: false,
             stable: false,
             session_id: None,
+            phase: None,
         }),
     }
 }
@@ -118,69 +154,23 @@ async fn record(
     let ctx = state
         .ctx
         .get()
-        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "collector not ready yet"))?
+        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "bot not ready"))?
         .clone();
 
-    let guild_id_obj = GuildId::new(req.guild_id);
-    let _channel_id = ChannelId::new(req.channel_id);
-
-    let bypass_ids = state.config.bypass_consent_user_ids();
-    if bypass_ids.is_empty() {
-        return Err(err(
-            StatusCode::PRECONDITION_FAILED,
-            "BYPASS_CONSENT_USER_IDS is empty; harness can't admit anyone",
-        ));
-    }
-
-    let members: Vec<(UserId, String)> = {
-        let guild = ctx
-            .cache
-            .guild(guild_id_obj)
-            .ok_or_else(|| err(StatusCode::NOT_FOUND, "guild not in cache"))?
-            .clone();
-
-        bypass_ids
-            .iter()
-            .map(|&uid| {
-                let user_id = UserId::new(uid);
-                let name = guild
-                    .members
-                    .get(&user_id)
-                    .map(|m| m.display_name().to_string())
-                    .unwrap_or_else(|| format!("bot_{}", uid));
-                (user_id, name)
-            })
-            .collect()
-    };
-
-    let initiator_id = ctx.cache.current_user().id;
-    let mut session = Session::new(
+    // No bypass list — the harness enrols participants via POST /enrol.
+    // The initial /record just spawns an empty session; the test runner
+    // then calls /enrol for each feeder bot.
+    let session = Session::new(
         req.guild_id,
         req.channel_id,
         req.channel_id,
-        initiator_id,
+        ctx.cache.current_user().id,
         state.config.min_participants,
         state.config.require_all_consent,
     );
-    for (uid, name) in &members {
-        session.add_participant(*uid, name.clone(), false);
-    }
     let session_id = session.id.clone();
-
-    // Spawn actor.
-    let handle = match spawn_session(state.clone(), ctx.clone(), session) {
-        Ok(h) => h,
-        Err(_) => {
-            return Err(err(
-                StatusCode::CONFLICT,
-                "a recording session is already active in this guild",
-            ));
-        }
-    };
-
-    // Data API: create_session + batch add participants.
-    let session_uuid = uuid::Uuid::parse_str(&session_id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("bad session id: {e}")))?;
+    let session_uuid =
+        uuid::Uuid::parse_str(&session_id).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("bad session id: {e}")))?;
     let s3_prefix = format!("sessions/{}/{}", req.guild_id, session_id);
     if let Err(e) = state
         .api
@@ -194,86 +184,99 @@ async fn record(
         )
         .await
     {
-        error!(error = %e, "harness create_session failed");
-        let _ = handle.send(SessionCmd::AutoStop).await;
         return Err(err(
             StatusCode::BAD_GATEWAY,
-            format!("data-api create_session: {e}"),
+            format!("create_session: {e}"),
         ));
     }
 
-    let batch_input: Vec<(u64, bool, Option<String>)> = members
-        .iter()
-        .map(|(uid, name)| (uid.get(), false, Some(name.clone())))
-        .collect();
-    match state.api.add_participants_batch(session_uuid, &batch_input).await {
-        Ok(rows) => {
-            for ((user_id, _), row) in members.iter().zip(rows.iter()) {
-                let _ = handle
-                    .send(SessionCmd::SetParticipantUuid {
-                        user_id: *user_id,
-                        participant_uuid: row.id,
-                    })
-                    .await;
-            }
-        }
-        Err(e) => {
-            error!(error = %e, "harness add_participants_batch failed");
-            let _ = state.api.abandon_session(session_uuid).await;
-            let _ = handle.send(SessionCmd::AutoStop).await;
-            return Err(err(
-                StatusCode::BAD_GATEWAY,
-                format!("data-api add_participants_batch: {e}"),
-            ));
-        }
+    let handle = spawn_session(state.clone(), ctx.clone(), session)
+        .map_err(|_| err(StatusCode::CONFLICT, "session already active"))?;
+    let _ = handle; // dropped naturally; the DashMap owns it now.
+
+    info!(%session_id, "harness_record — session spawned");
+    Ok(Json(RecordResponse { session_id }))
+}
+
+async fn enrol(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EnrolRequest>,
+) -> Result<Json<EnrolResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let handle = state
+        .sessions
+        .get(&req.guild_id)
+        .map(|e| e.clone())
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no active session in guild"))?;
+
+    let result = request(&handle, |reply| SessionCmd::Enrol {
+        user_id: UserId::new(req.user_id),
+        display_name: req.display_name,
+        is_bot: req.is_bot,
+        reply,
+    })
+    .await;
+
+    match result {
+        Ok(Ok(participant_id)) => Ok(Json(EnrolResponse { participant_id })),
+        Ok(Err(e)) => Err(err(StatusCode::CONFLICT, e.to_string())),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
+}
 
-    // Bypass consent for every admitted member.
-    let _ = handle
-        .send(SessionCmd::BypassConsent {
-            users: members.iter().map(|(uid, _)| *uid).collect(),
-        })
-        .await;
-    for (uid, _) in &members {
-        if let Err(e) = state.api.record_consent(session_uuid, uid.get(), "full").await {
-            warn!(
-                user_id = %uid,
-                error = %e,
-                "harness record_consent failed (non-fatal)",
-            );
-        }
+async fn consent(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ConsentRequest>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let scope = match req.scope.as_str() {
+        "full" => ConsentScope::Full,
+        "decline" => ConsentScope::Decline,
+        _ => return Err(err(StatusCode::BAD_REQUEST, "scope must be full or decline")),
+    };
+    let handle = state
+        .sessions
+        .get(&req.guild_id)
+        .map(|e| e.clone())
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no active session in guild"))?;
+
+    let result = request(&handle, |reply| SessionCmd::RecordConsent {
+        user: UserId::new(req.user_id),
+        scope,
+        reply,
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => Ok(Json(OkResponse { ok: true })),
+        Ok(Err(e)) => Err(err(StatusCode::CONFLICT, e.to_string())),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
+}
 
-    info!(
-        session_id = %session_id,
-        participants = members.len(),
-        "harness_record — starting recording pipeline",
-    );
-
-    // Fire StartRecording and await the outcome.
-    let outcome = request(&handle, |reply| SessionCmd::StartRecording { reply }).await;
-    match outcome {
-        Ok(StartRecordingOutcome::Recording) => Ok(Json(RecordResponse { session_id })),
-        Ok(StartRecordingOutcome::Preempted) => Err(err(
-            StatusCode::GONE,
-            "session preempted during startup (concurrent /stop?)",
-        )),
-        Ok(StartRecordingOutcome::DaveFailed) => Err(err(
-            StatusCode::GATEWAY_TIMEOUT,
-            "DAVE handshake failed after retries — no audio",
-        )),
-        Ok(StartRecordingOutcome::DaveRejoinFailed) => Err(err(
-            StatusCode::BAD_GATEWAY,
-            "mid-loop voice rejoin failed",
-        )),
-        Ok(StartRecordingOutcome::VoiceJoinFailed(msg)) => Err(err(
-            StatusCode::BAD_GATEWAY,
-            format!("voice join failed: {msg}"),
-        )),
-        Err(e) => Err(err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("actor gone: {e}"),
-        )),
+async fn license(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LicenseRequest>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let field = match req.field.as_str() {
+        "no_llm_training" => LicenseField::NoLlmTraining,
+        "no_public_release" => LicenseField::NoPublicRelease,
+        _ => return Err(err(StatusCode::BAD_REQUEST, "unknown license field")),
+    };
+    let handle = state
+        .sessions
+        .get(&req.guild_id)
+        .map(|e| e.clone())
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no active session in guild"))?;
+    let result = request(&handle, |reply| SessionCmd::SetLicense {
+        user: UserId::new(req.user_id),
+        field,
+        value: req.value,
+        reply,
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(Json(OkResponse { ok: true })),
+        Ok(Err(e)) => Err(err(StatusCode::CONFLICT, e.to_string())),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
@@ -281,49 +284,32 @@ async fn stop(
     State(state): State<Arc<AppState>>,
     Json(req): Json<StopRequest>,
 ) -> Result<Json<OkResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _ctx = state
-        .ctx
-        .get()
-        .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "collector not ready yet"))?
-        .clone();
+    let handle = state
+        .sessions
+        .get(&req.guild_id)
+        .map(|e| e.clone())
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "no active session in guild"))?;
 
-    let handle = match state.sessions.get(&req.guild_id) {
-        Some(h) => h.clone(),
-        None => {
-            return Err(err(
-                StatusCode::NOT_FOUND,
-                "no active recording session in guild",
-            ));
-        }
-    };
-
-    // Send AutoStop to preempt the session. The actor exits its run loop,
-    // which finalizes the session and removes its DashMap entry. Poll
-    // briefly for the DashMap removal so the harness caller sees "stop
-    // complete" only after metadata upload has kicked off — matching the
-    // pre-refactor await-to-completion semantics.
     let _ = handle.send(SessionCmd::AutoStop).await;
 
-    let guild_id = req.guild_id;
-    let state_poll = state.clone();
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while tokio::time::Instant::now() < deadline {
-        if !state_poll.sessions.contains_key(&guild_id) {
+        if !state.sessions.contains_key(&req.guild_id) {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-
-    info!(guild_id = req.guild_id, "harness_stop — finalized");
     Ok(Json(OkResponse { ok: true }))
 }
 
-fn router(state: Arc<AppState>) -> Router {
+pub(crate) fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/record", post(record))
+        .route("/enrol", post(enrol))
+        .route("/consent", post(consent))
+        .route("/license", post(license))
         .route("/stop", post(stop))
         .with_state(state)
 }
@@ -333,9 +319,8 @@ pub async fn spawn(state: Arc<AppState>) {
         return;
     }
     let port = state.config.harness_port;
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let app = router(state);
-
     tokio::spawn(async move {
         info!(%addr, "harness_http_listening");
         let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -349,4 +334,156 @@ pub async fn spawn(state: Arc<AppState>) {
             error!(error = %e, "harness_server_exited");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api_client::DataApiClient;
+    use crate::config::Config;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn cfg(harness_enabled: bool) -> Config {
+        Config {
+            token: "t".into(),
+            data_api_url: "http://127.0.0.1:1".into(),
+            data_api_shared_secret: "s".into(),
+            local_buffer_dir_raw: "".into(),
+            local_buffer_max_secs: 7200,
+            stabilization_gate_secs: 3,
+            min_participants: 1,
+            require_all_consent: true,
+            harness_enabled,
+            harness_port: 8010,
+        }
+    }
+
+    /// Build an AppState with a never-called DataApiClient by injecting a
+    /// hand-rolled instance via unsafe transmute is a bad idea — instead use
+    /// a HTTP client that won't be called: every handler we test ends in
+    /// "bot not ready" or "no session" before it ever touches the api.
+    fn app_state_sans_ctx() -> Arc<AppState> {
+        // We can't actually build a DataApiClient without a running server;
+        // for these tests the harness endpoints either 503 (not ready) or
+        // 404 (no session) BEFORE touching the api, so constructing a
+        // dummy client that panics on use is fine.
+        let api = DataApiClient::test_stub();
+        Arc::new(AppState::new(cfg(true), api))
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_reports_state() {
+        let state = app_state_sans_ctx();
+        let app = router(state);
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!health.ready, "ctx not set → ready=false");
+        assert!(health.harness_enabled);
+    }
+
+    #[tokio::test]
+    async fn enrol_404s_when_no_session() {
+        let state = app_state_sans_ctx();
+        let app = router(state);
+        let body = serde_json::json!({
+            "guild_id": 42u64,
+            "user_id": 100u64,
+            "display_name": "alice",
+            "is_bot": false,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/enrol")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn consent_404s_when_no_session() {
+        let state = app_state_sans_ctx();
+        let app = router(state);
+        let body = serde_json::json!({
+            "guild_id": 42u64,
+            "user_id": 100u64,
+            "scope": "full",
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/consent")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn license_404s_when_no_session() {
+        let state = app_state_sans_ctx();
+        let app = router(state);
+        let body = serde_json::json!({
+            "guild_id": 42u64,
+            "user_id": 100u64,
+            "field": "no_llm_training",
+            "value": true,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/license")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn consent_rejects_invalid_scope() {
+        let state = app_state_sans_ctx();
+        let app = router(state);
+        let body = serde_json::json!({
+            "guild_id": 42u64,
+            "user_id": 100u64,
+            "scope": "not-a-scope",
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/consent")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn license_rejects_unknown_field() {
+        let state = app_state_sans_ctx();
+        let app = router(state);
+        let body = serde_json::json!({
+            "guild_id": 42u64,
+            "user_id": 100u64,
+            "field": "not-a-field",
+            "value": true,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/license")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

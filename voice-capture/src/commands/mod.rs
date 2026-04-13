@@ -1,6 +1,6 @@
-//! Slash command and button handlers.
+//! Slash-command and component handlers.
 
 pub mod consent;
-pub mod license;
 pub mod record;
+pub mod respond;
 pub mod stop;

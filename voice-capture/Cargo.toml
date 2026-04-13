@@ -21,6 +21,7 @@ symphonia = { version = "0.5", features = ["wav", "pcm", "ogg", "vorbis"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Config + CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -64,3 +65,6 @@ prometheus = ["dep:metrics-exporter-prometheus"]
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 walkdir = "2"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tower = { version = "0.5", features = ["util"] }

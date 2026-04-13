@@ -171,6 +171,21 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ApiE
 }
 
 impl DataApiClient {
+    /// Build a stub client for tests that never actually talk to the API.
+    /// Calls will fail with connection errors — callers must ensure their
+    /// test path doesn't reach the network. Dev-only; hidden behind
+    /// `#[cfg(test)]` so it can't ship.
+    #[cfg(test)]
+    pub fn test_stub() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:0".to_string(),
+            session_token: tokio::sync::RwLock::new(String::new()),
+            shared_secret: String::new(),
+            service_name: "test".to_string(),
+        }
+    }
+
     /// Authenticate with the Data API using a shared secret.
     /// Returns a client ready to make authenticated requests.
     pub async fn authenticate(
@@ -272,6 +287,7 @@ impl DataApiClient {
     }
 
     /// Update session status (replaces db::update_session_state).
+    #[allow(dead_code)]
     pub async fn update_session_state(
         &self,
         session_id: Uuid,
@@ -501,6 +517,7 @@ impl DataApiClient {
     /// Toggle a license flag (no_llm_training or no_public_release).
     /// Fallback path. Returns the new (no_llm_training, no_public_release)
     /// tuple for the caller to display in the refreshed button row.
+    #[allow(dead_code)]
     pub async fn toggle_license_flag(
         &self,
         session_id: Uuid,
@@ -522,6 +539,7 @@ impl DataApiClient {
     /// values (e.g. from the previous PATCH response or the initial
     /// add_participants_batch response). Returns the new
     /// (no_llm_training, no_public_release) tuple.
+    #[allow(dead_code)]
     pub async fn toggle_license_flag_by_id(
         &self,
         participant_id: Uuid,
@@ -534,6 +552,21 @@ impl DataApiClient {
             "no_public_release" => (None, Some(!current_no_public)),
             _ => return Ok((current_no_llm, current_no_public)),
         };
+        self.set_license_flags_by_id(participant_id, no_llm, no_public)
+            .await
+    }
+
+    /// Set license flags directly — absolute (not toggle) semantics. `None`
+    /// leaves the field unchanged on the server. Used by:
+    ///   - F4 default-flag writes on Accept (both `Some(false)`).
+    ///   - Harness `POST /license` (one field explicitly set).
+    ///   - Future portal license UI.
+    pub async fn set_license_flags_by_id(
+        &self,
+        participant_id: Uuid,
+        no_llm_training: Option<bool>,
+        no_public_release: Option<bool>,
+    ) -> Result<(bool, bool), ApiError> {
         let resp = self
             .client
             .patch(format!(
@@ -542,8 +575,8 @@ impl DataApiClient {
             ))
             .header("authorization", self.auth_header().await)
             .json(&UpdateLicenseRequest {
-                no_llm_training: no_llm,
-                no_public_release: no_public,
+                no_llm_training,
+                no_public_release,
             })
             .send()
             .await?;
