@@ -27,6 +27,24 @@ pub async fn handle_record(
 ) -> Result<(), serenity::Error> {
     let guild_id = command.guild_id.unwrap();
 
+    // Defer the interaction IMMEDIATELY. Discord gives us exactly 3 seconds
+    // from the user's click to ack. Deferring first — before any cache
+    // lookup, mutex, or network call — eliminates the entire class of
+    // "Unknown interaction" errors that blew up the first-click path on
+    // the new NBG1 stack. The 15-minute followup window covers everything
+    // downstream.
+    //
+    // Trade-off: early-exit paths (no voice channel, too few members) use
+    // edit_response instead of create_response(Message). The user briefly
+    // sees "bot is thinking…" before the error, which is a marginal UX
+    // cost to eliminate the ack-timing failure mode.
+    command
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true)),
+        )
+        .await?;
+
     // Find the user's voice channel (cache lookup, instant)
     let guild = ctx.cache.guild(guild_id).unwrap().clone();
     let channel_id = guild
@@ -38,13 +56,10 @@ pub async fn handle_record(
         Some(id) => id,
         None => {
             command
-                .create_response(
+                .edit_response(
                     &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("You need to be in a voice channel.")
-                            .ephemeral(true),
-                    ),
+                    EditInteractionResponse::new()
+                        .content("You need to be in a voice channel."),
                 )
                 .await?;
             return Ok(());
@@ -76,16 +91,12 @@ pub async fn handle_record(
 
     if members.len() < state.config.min_participants {
         command
-            .create_response(
+            .edit_response(
                 &ctx.http,
-                CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content(format!(
-                            "Need at least {} people in the voice channel.",
-                            state.config.min_participants
-                        ))
-                        .ephemeral(true),
-                ),
+                EditInteractionResponse::new().content(format!(
+                    "Need at least {} people in the voice channel.",
+                    state.config.min_participants
+                )),
             )
             .await?;
         return Ok(());
@@ -113,27 +124,15 @@ pub async fn handle_record(
         if let Err(_rejected) = sessions.try_insert(session) {
             drop(sessions);
             command
-                .create_response(
+                .edit_response(
                     &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("A recording session is already active in this server.")
-                            .ephemeral(true),
-                    ),
+                    EditInteractionResponse::new()
+                        .content("A recording session is already active in this server."),
                 )
                 .await?;
             return Ok(());
         }
     }
-
-    // Slot reserved. Defer the Discord interaction so the slow work below
-    // can run without fighting the 3-second response window.
-    command
-        .create_response(
-            &ctx.http,
-            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
-        )
-        .await?;
 
     // Persist session and participants to Data API. Track the first hard
     // failure so we can roll back cleanly — individual add_participant
