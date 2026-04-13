@@ -92,17 +92,20 @@ impl EventHandler for Handler {
                     {
                         error!(error = %e, "consent_button_error");
                         // If the handler errored before ack'ing and the
-                        // session is still in AwaitingConsent, clear it so
-                        // the user can /record again without hitting the
-                        // "already active" guard.
-                        if let Some(gid) = component.guild_id {
-                            let mut sessions = state.sessions.lock().await;
-                            if let Some(session) = sessions.get(gid.get())
-                                && matches!(session.phase, session::Phase::AwaitingConsent)
-                            {
-                                info!(guild_id = %gid, "cleaning_up_stale_session");
-                                sessions.remove(gid.get());
-                            }
+                        // actor is still alive, ask it to tear down via
+                        // AutoStop so the user can /record again without
+                        // hitting the "already active" guard. The actor's
+                        // AutoStop handler is a no-op if the session has
+                        // already left AwaitingConsent, which matches the
+                        // previous behaviour (we only cleaned up sessions
+                        // sitting in AwaitingConsent).
+                        if let Some(gid) = component.guild_id
+                            && let Some(handle) = state.sessions.get(&gid.get())
+                        {
+                            info!(guild_id = %gid, "cleaning_up_stale_session");
+                            let _ = handle
+                                .send(session::actor::SessionCmd::AutoStop)
+                                .await;
                         }
                     }
                 });
@@ -112,7 +115,19 @@ impl EventHandler for Handler {
     }
 
     async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
-        voice::events::handle_voice_state_update(ctx, old, new, self.state.clone()).await;
+        // Spawn into a detached task so the gateway event loop never blocks
+        // on this handler's work. voice_state_update can do multiple HTTP
+        // calls (blocklist check, add_participant, Discord message send)
+        // and holds sessions.lock() across awaits — if we awaited here,
+        // subsequent gateway events (including slash-command interactions)
+        // would queue behind it and their 3-second ack windows would
+        // expire, producing "Unknown interaction" errors on /record and
+        // /stop. Interaction::Command and Interaction::Component already
+        // follow this pattern below.
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            voice::events::handle_voice_state_update(ctx, old, new, state).await;
+        });
     }
 }
 

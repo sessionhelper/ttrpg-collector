@@ -54,6 +54,7 @@ rustls = { version = "0.23", features = ["ring"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytemuck = "1"
+dashmap = "6"
 
 
 [features]

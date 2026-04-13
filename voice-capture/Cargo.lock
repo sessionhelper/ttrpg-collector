@@ -357,6 +357,7 @@ dependencies = [
  "bytemuck",
  "chrono",
  "clap",
+ "dashmap 6.1.0",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",

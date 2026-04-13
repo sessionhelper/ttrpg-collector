@@ -2,6 +2,14 @@
 //!
 //! All per-session data lives here in one struct, with state transitions
 //! enforced via enum variants. No more scattered HashMaps in AppState.
+//!
+//! The actor that wraps `Session` — providing serialized mutation, heal
+//! timer, and cancellation semantics — lives in the [`actor`] submodule.
+//! External handlers (slash commands, button clicks, voice events) must
+//! not construct a raw `Session` for insertion; they spawn an actor via
+//! [`actor::spawn_session`] and interact through [`actor::SessionHandle`].
+
+pub mod actor;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -136,8 +144,10 @@ impl Phase {
     }
 
     /// True if this phase means the session is on its way out — no further
-    /// state mutation should happen except the final remove. Used by
-    /// `pipeline_aborted` to detect concurrent /stop preemption.
+    /// state mutation should happen except the final remove. Retained for
+    /// test symmetry with `is_stoppable` and as a convenience for any
+    /// future code that inspects phase from outside the actor.
+    #[allow(dead_code)]
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Finalizing | Self::Cancelled | Self::Complete)
     }
@@ -628,62 +638,6 @@ pub fn consent_buttons() -> CreateActionRow {
     ])
 }
 
-/// Manages sessions across guilds. One active session per guild.
-pub struct SessionManager {
-    sessions: HashMap<u64, Session>,
-}
-
-impl SessionManager {
-    /// Create an empty session manager.
-    pub fn new() -> Self {
-        Self { sessions: HashMap::new() }
-    }
-
-    /// Atomically reserve a slot for a guild: insert the session if and only
-    /// if there is no existing active session for that guild. Returns `Ok(())`
-    /// on successful reservation, or `Err(session)` handing the session back
-    /// in a Box (Session is ~272 bytes; the Box keeps the Result variant
-    /// sizes balanced per clippy::result_large_err).
-    ///
-    /// This is the only supported insertion path. A raw check-then-insert
-    /// sequence was previously racy because the slow work between the two
-    /// (Data API calls, Discord response) released the mutex and let a
-    /// concurrent /record slip through.
-    pub fn try_insert(&mut self, session: Session) -> Result<(), Box<Session>> {
-        if self.has_active(session.guild_id) {
-            return Err(Box::new(session));
-        }
-        self.sessions.insert(session.guild_id, session);
-        Ok(())
-    }
-
-    /// Look up a session by guild ID.
-    pub fn get(&self, guild_id: u64) -> Option<&Session> {
-        self.sessions.get(&guild_id)
-    }
-
-    /// Look up a session mutably by guild ID.
-    pub fn get_mut(&mut self, guild_id: u64) -> Option<&mut Session> {
-        self.sessions.get_mut(&guild_id)
-    }
-
-    /// Remove and return a session by guild ID.
-    pub fn remove(&mut self, guild_id: u64) -> Option<Session> {
-        self.sessions.remove(&guild_id)
-    }
-
-    /// True if the guild has a session the user can still act on.
-    /// Matches every non-terminal phase (AwaitingConsent, StartingRecording,
-    /// Recording). Finalizing / Cancelled / Complete are terminal and not
-    /// counted as "active" — a new /record is allowed once we're past the
-    /// audio capture stage.
-    pub fn has_active(&self, guild_id: u64) -> bool {
-        self.sessions
-            .get(&guild_id)
-            .is_some_and(|s| s.phase.is_stoppable())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests — pure logic only (no Songbird Call, no Data API client, no
 // Discord).
@@ -966,50 +920,4 @@ mod tests {
         assert_eq!(parsed["participant_count"], 3);
     }
 
-    // --- SessionManager atomicity ---
-    //
-    // Session isn't Debug (carries non-Debug songbird/tokio handles), so
-    // `.unwrap()` / `.unwrap_err()` on try_insert's Result<(), Box<Session>>
-    // won't compile. We use an explicit `if is_err { panic }` helper and
-    // match for the Err-inspecting test.
-
-    fn try_insert_or_panic(mgr: &mut SessionManager, s: Session) {
-        if mgr.try_insert(s).is_err() {
-            panic!("try_insert failed unexpectedly");
-        }
-    }
-
-    #[test]
-    fn session_manager_try_insert_ok_when_empty() {
-        let mut mgr = SessionManager::new();
-        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
-        assert!(mgr.has_active(111));
-    }
-
-    #[test]
-    fn session_manager_try_insert_rejects_duplicate_guild() {
-        let mut mgr = SessionManager::new();
-        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
-        let second = session_with_three_participants(2, true);
-        let second_id = second.id.clone();
-        match mgr.try_insert(second) {
-            Err(rejected) => assert_eq!(rejected.id, second_id),
-            Ok(()) => panic!("expected try_insert to reject duplicate guild"),
-        }
-    }
-
-    #[test]
-    fn session_manager_try_insert_ok_after_remove() {
-        let mut mgr = SessionManager::new();
-        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
-        mgr.remove(111);
-        assert!(!mgr.has_active(111));
-        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
-    }
-
-    #[test]
-    fn session_manager_has_active_false_for_empty() {
-        let mgr = SessionManager::new();
-        assert!(!mgr.has_active(111));
-    }
 }

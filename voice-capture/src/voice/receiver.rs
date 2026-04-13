@@ -455,6 +455,7 @@ fn process_packet(
 
 /// OP5 event sent from SpeakingTracker to the DAVE heal system.
 /// Signals that Discord's voice server reported a user started transmitting.
+#[allow(dead_code)] // fields populated for future heal-path inspection; currently drained without introspection.
 pub struct Op5Event {
     pub ssrc: u32,
     pub user_id: u64,
