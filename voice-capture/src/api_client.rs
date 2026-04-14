@@ -603,57 +603,30 @@ impl DataApiClient {
 
     // --- Audio ---
 
-    /// Upload a PCM audio chunk (replaces s3.upload_bytes for audio).
-    /// Sends raw bytes as the request body. Single-attempt — prefer
-    /// [`upload_chunk_with_retry`] for live-recording code paths where
-    /// a transient data-api blip must not drop audio (R7). Kept on the
-    /// public surface as the underlying primitive; currently unused by
-    /// production code, but useful for tests and for ad-hoc callers
-    /// that need single-attempt semantics.
-    #[allow(dead_code)]
-    pub async fn upload_chunk(
-        &self,
-        session_id: Uuid,
-        pseudo_id: &str,
-        data: Vec<u8>,
-    ) -> Result<(), ApiError> {
-        let size = data.len();
-        let resp = self
-            .client
-            .post(format!(
-                "{}/internal/sessions/{}/audio/{}/chunk",
-                self.base_url, session_id, pseudo_id
-            ))
-            .header("authorization", self.auth_header().await)
-            .header("content-type", "application/octet-stream")
-            .body(data)
-            .send()
-            .await?;
-        check_status(resp).await?;
-        info!(session_id = %session_id, pseudo_id = %pseudo_id, size = size, "chunk_uploaded");
-        Ok(())
-    }
-
     /// Upload a PCM audio chunk with retry on transient errors (R7).
     ///
-    /// Retry policy, mirroring `chronicle-worker::api_client::download_chunk_with_retry`:
-    /// - **5xx** (server error) or network error: retry up to 3 times with
-    ///   1s / 2s / 4s backoff.
-    /// - **401** (unauthorized): re-authenticate once, then retry. The
-    ///   collector's token is reaped by the Data API after 90s of
-    ///   heartbeat silence, so this path fires on the first upload after
-    ///   a heartbeat interruption.
-    /// - **4xx** (other client errors): fail immediately — retrying a
-    ///   400/413/etc. will not resolve the underlying problem.
+    /// Per-chunk headers (required by the locked data-api spec):
+    /// - `X-Capture-Started-At` — UTC timestamp of the first sample in this
+    ///   chunk, ISO-8601. For pre-gate flushed chunks this is the original
+    ///   capture time (possibly minutes before gate-open); for post-gate
+    ///   live chunks it is "now when the accumulator rolled over." The
+    ///   data-api uses this to reconstruct the stream as if it had been
+    ///   arriving live even for chunks that were cached pre-gate.
+    /// - `X-Duration-Ms` — PCM-derived wall-clock duration of this chunk.
+    /// - `X-Client-Chunk-Id` — idempotency key, `{session}:{pseudo}:{seq}`.
     ///
-    /// On success returns `Ok(())`. On final failure (all 3 attempts
-    /// exhausted, or a non-retryable 4xx) returns the last error seen
-    /// so the caller can log it and mark the chunk as lost.
+    /// Retry policy, mirroring `chronicle-worker::api_client::download_chunk_with_retry`:
+    /// - **5xx** or network error: retry up to 3 times with 1s/2s/4s backoff.
+    /// - **401**: re-authenticate once, retry.
+    /// - **4xx**: fail immediately.
     pub async fn upload_chunk_with_retry(
         &self,
         session_id: Uuid,
         pseudo_id: &str,
         data: Vec<u8>,
+        capture_started_at: DateTime<Utc>,
+        duration_ms: u64,
+        client_chunk_id: &str,
     ) -> Result<(), ApiError> {
         const MAX_RETRIES: u32 = 3;
         let backoff_durations = [
@@ -666,11 +639,8 @@ impl DataApiClient {
             "{}/internal/sessions/{}/audio/{}/chunk",
             self.base_url, session_id, pseudo_id
         );
+        let captured_hdr = capture_started_at.to_rfc3339();
 
-        // Track whether we've already burned our one 401 re-auth retry.
-        // Two 401s in a row means re-auth silently failed to fix the
-        // token (e.g. shared_secret rotated out from under us) — bail
-        // instead of spinning forever.
         let mut reauth_attempted = false;
         let mut attempt: u32 = 0;
 
@@ -681,6 +651,9 @@ impl DataApiClient {
                 .post(&url)
                 .header("authorization", self.auth_header().await)
                 .header("content-type", "application/octet-stream")
+                .header("x-capture-started-at", &captured_hdr)
+                .header("x-duration-ms", duration_ms.to_string())
+                .header("x-client-chunk-id", client_chunk_id)
                 .body(data.clone())
                 .send()
                 .await;
@@ -790,6 +763,20 @@ impl DataApiClient {
 
     // --- Metadata ---
 
+    /// Construct an instance pointing at the supplied base URL with no auth
+    /// flow. Used only by integration tests that host their own local
+    /// test server; never shipped.
+    #[cfg(test)]
+    pub fn for_test_base_url(base_url: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into(),
+            session_token: tokio::sync::RwLock::new("test-token".to_string()),
+            shared_secret: String::new(),
+            service_name: "test".to_string(),
+        }
+    }
+
     /// Upload session metadata (meta.json + consent.json) to the Data API.
     pub async fn write_metadata(
         &self,
@@ -817,5 +804,99 @@ impl DataApiClient {
             .await?;
         check_status(resp).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use chrono::TimeZone;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as TokioMutex;
+
+    #[derive(Default)]
+    struct Captured {
+        capture_started_at: Option<String>,
+        duration_ms: Option<String>,
+        client_chunk_id: Option<String>,
+        body_len: usize,
+    }
+
+    async fn chunk_sink(
+        State(state): State<Arc<TokioMutex<Captured>>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, Body) {
+        let mut c = state.lock().await;
+        c.capture_started_at = headers
+            .get("x-capture-started-at")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        c.duration_ms = headers
+            .get("x-duration-ms")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        c.client_chunk_id = headers
+            .get("x-client-chunk-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        c.body_len = body.len();
+        (
+            StatusCode::OK,
+            Body::from(r#"{"key":"k","seq":0}"#.to_string()),
+        )
+    }
+
+    async fn run_test_server(
+        captured: Arc<TokioMutex<Captured>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let router = Router::new()
+            .route(
+                "/internal/sessions/:sid/audio/:pseudo/chunk",
+                post(chunk_sink),
+            )
+            .with_state(captured);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn upload_chunk_carries_capture_started_at_header() {
+        let captured = Arc::new(TokioMutex::new(Captured::default()));
+        let (base, _srv) = run_test_server(captured.clone()).await;
+
+        let client = DataApiClient::for_test_base_url(base);
+        let sid = uuid::Uuid::new_v4();
+        let capture_ts = chrono::Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .unwrap();
+        client
+            .upload_chunk_with_retry(
+                sid,
+                "pseudo-1",
+                vec![1u8, 2, 3, 4],
+                capture_ts,
+                42,
+                "client-chunk-id-xyz",
+            )
+            .await
+            .unwrap();
+
+        let c = captured.lock().await;
+        assert_eq!(c.capture_started_at.as_deref(), Some(capture_ts.to_rfc3339().as_str()));
+        assert_eq!(c.duration_ms.as_deref(), Some("42"));
+        assert_eq!(c.client_chunk_id.as_deref(), Some("client-chunk-id-xyz"));
+        assert_eq!(c.body_len, 4);
     }
 }

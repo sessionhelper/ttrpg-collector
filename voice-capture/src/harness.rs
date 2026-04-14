@@ -157,9 +157,8 @@ async fn record(
         .ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "bot not ready"))?
         .clone();
 
-    // No bypass list — the harness enrols participants via POST /enrol.
-    // The initial /record just spawns an empty session; the test runner
-    // then calls /enrol for each feeder bot.
+    // No bypass list, no pre-gate data-api calls. The actor creates the
+    // session row at gate-open.
     let session = Session::new(
         req.guild_id,
         req.channel_id,
@@ -169,30 +168,9 @@ async fn record(
         state.config.require_all_consent,
     );
     let session_id = session.id.clone();
-    let session_uuid =
-        uuid::Uuid::parse_str(&session_id).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("bad session id: {e}")))?;
-    let s3_prefix = format!("sessions/{}/{}", req.guild_id, session_id);
-    if let Err(e) = state
-        .api
-        .create_session(
-            session_uuid,
-            req.guild_id as i64,
-            chrono::Utc::now(),
-            None,
-            None,
-            Some(s3_prefix),
-        )
-        .await
-    {
-        return Err(err(
-            StatusCode::BAD_GATEWAY,
-            format!("create_session: {e}"),
-        ));
-    }
 
-    let handle = spawn_session(state.clone(), ctx.clone(), session)
+    spawn_session(state.clone(), ctx.clone(), session)
         .map_err(|_| err(StatusCode::CONFLICT, "session already active"))?;
-    let _ = handle; // dropped naturally; the DashMap owns it now.
 
     info!(%session_id, "harness_record — session spawned");
     Ok(Json(RecordResponse { session_id }))

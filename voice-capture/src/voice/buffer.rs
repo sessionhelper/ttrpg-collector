@@ -1,22 +1,34 @@
-//! Disk-backed pre-consent audio cache (F2).
+//! Disk-backed per-speaker (and mixed-track) audio cache (F2, F8).
 //!
-//! Every participant in an active session gets its own sub-directory under
-//! `$LOCAL_BUFFER_DIR/<session_id>/<pseudo_id>/`. Decrypted PCM frames stream
-//! in as `chunk_<seq:06>.pcm` files written in append order.
+//! Layout:
 //!
-//! - On Accept, [`flush_and_delete`] streams each chunk file to the data-api
-//!   in strict sequence order and then deletes the participant's subdirectory.
-//! - On Decline/timeout or session end, [`delete_participant`] /
-//!   [`delete_session`] unlink the relevant directory.
-//! - A per-participant cap (`LOCAL_BUFFER_MAX_SECS`) triggers oldest-first
-//!   eviction. Each eviction increments `chronicle_prerolled_chunks_dropped_total`.
+//! ```text
+//! $LOCAL_BUFFER_DIR/<session_id>/
+//!   <pseudo_id>/                         # one dir per participant
+//!     chunk_<seq:06>_<capture_ms>.pcm    # filename carries original capture time
+//!   mixed/                               # reserved pseudo_id for F8 mix track
+//!     chunk_<seq:06>_<capture_ms>.pcm
+//! ```
 //!
-//! The cache keeps RAM flat: all PCM lives on disk until flushed.
+//! Every chunk filename embeds the millisecond-precision UTC timestamp at
+//! which the first sample was captured. That timestamp is preserved across
+//! the gate-flush — the bot POSTs it back to chronicle-data-api via the
+//! `X-Capture-Started-At` header so the server side reconstructs the stream
+//! as if it had been arriving live all along.
+//!
+//! Pre-gate the cache is authoritative for every participant. At gate-open
+//! the actor walks each surviving subdirectory in sequence order and POSTs
+//! the bytes to chronicle-data-api, then deletes the participant's subdir.
+//! Declined subdirs are deleted without upload.
+//!
+//! Per-participant `LOCAL_BUFFER_MAX_SECS` cap triggers oldest-first
+//! eviction to keep disk usage bounded.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use chrono::{DateTime, TimeZone, Utc};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -25,12 +37,13 @@ use crate::api_client::{ApiError, DataApiClient};
 /// 48kHz × 16-bit × stereo = 192_000 bytes per second per participant.
 pub const BYTES_PER_SECOND_48K_S16_STEREO: u64 = 48_000 * 2 * 2;
 
+/// Reserved pseudo_id for the mixed track (F8).
+pub const MIXED_PSEUDO_ID: &str = "mixed";
+
 /// Roots the cache layout. Cheap to clone — every session handle carries one.
 #[derive(Clone)]
 pub struct BufferRoot {
-    /// `$LOCAL_BUFFER_DIR`
     root: PathBuf,
-    /// Per-participant cap in bytes, computed from seconds × sample-rate × channels × bit-depth.
     max_bytes_per_participant: u64,
 }
 
@@ -47,19 +60,16 @@ impl BufferRoot {
         &self.root
     }
 
-    /// Per-session root: `$LOCAL_BUFFER_DIR/<session_id>/`
     pub fn session_dir(&self, session_id: &str) -> PathBuf {
         self.root.join(session_id)
     }
 
-    /// Per-participant root: `$LOCAL_BUFFER_DIR/<session_id>/<pseudo_id>/`
     pub fn participant_dir(&self, session_id: &str, pseudo_id: &str) -> PathBuf {
         self.session_dir(session_id).join(pseudo_id)
     }
 }
 
-/// Per-participant writer. One per pseudo_id. Owns the directory handle and
-/// the next sequence number.
+/// Per-participant writer. Owns the directory handle and next sequence number.
 pub struct ParticipantCache {
     dir: PathBuf,
     next_seq: u32,
@@ -67,11 +77,6 @@ pub struct ParticipantCache {
 }
 
 impl ParticipantCache {
-    /// Open (or create) the participant's cache sub-directory. Scans for
-    /// existing `chunk_<seq>.pcm` files and resumes the seq counter after
-    /// the highest-numbered file — supports the case where the buffer_task
-    /// reuses a writer across a heal-driven `attach` cycle. On first call
-    /// for a fresh participant the directory is empty and `next_seq = 0`.
     pub fn open(root: &BufferRoot, session_id: &str, pseudo_id: &str) -> io::Result<Self> {
         let dir = root.participant_dir(session_id, pseudo_id);
         std::fs::create_dir_all(&dir)?;
@@ -84,12 +89,16 @@ impl ParticipantCache {
         })
     }
 
-    /// Write a fresh chunk file. Returns the chunk's sequence number.
-    /// Triggers oldest-first eviction if the per-participant cap is exceeded
-    /// after the write.
-    pub fn append_chunk(&mut self, bytes: &[u8]) -> io::Result<u32> {
+    /// Append a chunk with its capture-start timestamp. Filename encodes both
+    /// the sequence number and the millisecond-precision timestamp. Returns
+    /// the seq written.
+    pub fn append_chunk(
+        &mut self,
+        bytes: &[u8],
+        capture_started_at: DateTime<Utc>,
+    ) -> io::Result<u32> {
         let seq = self.next_seq;
-        let path = self.dir.join(format!("chunk_{:06}.pcm", seq));
+        let path = chunk_path(&self.dir, seq, capture_started_at);
         let mut f = std::fs::File::create(&path)?;
         f.write_all(bytes)?;
         f.sync_data().ok();
@@ -98,15 +107,11 @@ impl ParticipantCache {
         Ok(seq)
     }
 
-    /// Enumerate on-disk chunks in strictly-ascending sequence order. Kept
-    /// on the public surface for the test suite; production code uses
-    /// [`flush_and_delete`] directly.
     #[allow(dead_code)]
     pub fn chunks_in_order(&self) -> io::Result<Vec<CachedChunk>> {
         list_chunks(&self.dir)
     }
 
-    /// Remove every chunk and the participant's sub-directory. Idempotent.
     pub fn delete(&self) -> io::Result<()> {
         remove_dir_idempotent(&self.dir)
     }
@@ -117,15 +122,11 @@ impl ParticipantCache {
 
     fn enforce_cap(&mut self) -> io::Result<()> {
         loop {
-            let mut total: u64 = 0;
             let entries = list_chunks(&self.dir)?;
-            for e in &entries {
-                total = total.saturating_add(e.bytes);
-            }
+            let total: u64 = entries.iter().map(|c| c.bytes).sum();
             if total <= self.max_bytes || entries.is_empty() {
                 return Ok(());
             }
-            // Drop the oldest chunk, bump the metric, log WARN, loop.
             let oldest = &entries[0];
             warn!(
                 path = %oldest.path.display(),
@@ -146,6 +147,12 @@ pub struct CachedChunk {
     pub seq: u32,
     pub path: PathBuf,
     pub bytes: u64,
+    pub capture_started_at: DateTime<Utc>,
+}
+
+fn chunk_path(dir: &Path, seq: u32, capture_started_at: DateTime<Utc>) -> PathBuf {
+    let ms = capture_started_at.timestamp_millis();
+    dir.join(format!("chunk_{seq:06}_{ms}.pcm"))
 }
 
 fn list_chunks(dir: &Path) -> io::Result<Vec<CachedChunk>> {
@@ -160,12 +167,13 @@ fn list_chunks(dir: &Path) -> io::Result<Vec<CachedChunk>> {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(seq) = parse_chunk_seq(&name) {
+        if let Some((seq, captured_ms)) = parse_chunk_name(&name) {
             let meta = entry.metadata()?;
             out.push(CachedChunk {
                 seq,
                 path: entry.path(),
                 bytes: meta.len(),
+                capture_started_at: ms_to_datetime(captured_ms),
             });
         }
     }
@@ -178,9 +186,16 @@ fn max_existing_seq(dir: &Path) -> io::Result<u32> {
     Ok(chunks.last().map(|c| c.seq).unwrap_or(0))
 }
 
-fn parse_chunk_seq(name: &str) -> Option<u32> {
+fn parse_chunk_name(name: &str) -> Option<(u32, i64)> {
     let base = name.strip_prefix("chunk_")?.strip_suffix(".pcm")?;
-    base.parse().ok()
+    let mut parts = base.splitn(2, '_');
+    let seq = parts.next()?.parse::<u32>().ok()?;
+    let ms = parts.next()?.parse::<i64>().ok()?;
+    Some((seq, ms))
+}
+
+fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
 }
 
 fn is_dir_empty(dir: &Path) -> io::Result<bool> {
@@ -195,8 +210,6 @@ fn remove_dir_idempotent(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Walk the root directory and unlink any `<session_id>` subdir that exists —
-/// used by `main.rs` at startup to clean crashed-run remnants.
 pub fn sweep_on_startup(root: &Path) {
     if !root.exists() {
         return;
@@ -220,12 +233,10 @@ pub fn sweep_on_startup(root: &Path) {
     }
 }
 
-/// Delete the entire session subtree. Idempotent.
 pub fn delete_session(root: &BufferRoot, session_id: &str) -> io::Result<()> {
     remove_dir_idempotent(&root.session_dir(session_id))
 }
 
-/// Delete a participant's subtree. Idempotent.
 #[allow(dead_code)]
 pub fn delete_participant(
     root: &BufferRoot,
@@ -235,10 +246,6 @@ pub fn delete_participant(
     remove_dir_idempotent(&root.participant_dir(session_id, pseudo_id))
 }
 
-/// Count total bytes currently cached across all sessions/participants under
-/// `root`. Used periodically by a spawn_blocking task to update
-/// `chronicle_prerolled_chunks_cached_bytes`. Blocking — never call inside an
-/// async context.
 pub fn walk_total_bytes(root: &Path) -> io::Result<u64> {
     if !root.exists() {
         return Ok(0);
@@ -261,8 +268,7 @@ pub fn walk_total_bytes(root: &Path) -> io::Result<u64> {
 }
 
 /// Stream every cached chunk for (session_id, pseudo_id) to the data-api in
-/// sequence order and then unlink the participant's directory. Happy-path
-/// invocation after an Accept click.
+/// sequence order with its original capture timestamp, then unlink the dir.
 pub async fn flush_and_delete(
     api: Arc<DataApiClient>,
     session_uuid: Uuid,
@@ -285,9 +291,18 @@ pub async fn flush_and_delete(
         .await
         .map_err(|e| FlushError::Join(e.to_string()))??;
 
-        api.upload_chunk_with_retry(session_uuid, pseudo_id, bytes)
-            .await
-            .map_err(FlushError::Api)?;
+        let client_chunk_id = format!("{session_uuid}:{pseudo_id}:{}", chunk.seq);
+        let duration_ms = pcm_bytes_to_duration_ms(bytes.len());
+        api.upload_chunk_with_retry(
+            session_uuid,
+            pseudo_id,
+            bytes,
+            chunk.capture_started_at,
+            duration_ms,
+            &client_chunk_id,
+        )
+        .await
+        .map_err(FlushError::Api)?;
         uploaded += 1;
     }
 
@@ -301,7 +316,12 @@ pub async fn flush_and_delete(
     Ok(uploaded)
 }
 
-/// Errors from the Accept-driven flush path.
+/// 48kHz stereo s16le: 192_000 bytes/sec → ms = bytes / 192.
+pub fn pcm_bytes_to_duration_ms(bytes: usize) -> u64 {
+    (bytes as u64).saturating_mul(1000) / BYTES_PER_SECOND_48K_S16_STEREO.max(1)
+}
+
+/// Errors from the gate-flush path.
 #[derive(Debug, thiserror::Error)]
 pub enum FlushError {
     #[error("io: {0}")]
@@ -323,29 +343,38 @@ mod tests {
         (td, root)
     }
 
+    fn now_plus_ms(offset_ms: i64) -> DateTime<Utc> {
+        Utc.timestamp_millis_opt(1_700_000_000_000 + offset_ms)
+            .single()
+            .unwrap()
+    }
+
     #[test]
-    fn append_then_list_preserves_sequence() {
+    fn append_then_list_preserves_sequence_and_timestamps() {
         let (_td, root) = root_with(7200);
         let mut cache = ParticipantCache::open(&root, "sess1", "pseudo1").unwrap();
-        assert_eq!(cache.append_chunk(b"aaa").unwrap(), 0);
-        assert_eq!(cache.append_chunk(b"bbbb").unwrap(), 1);
-        assert_eq!(cache.append_chunk(b"ccccc").unwrap(), 2);
+        let ts0 = now_plus_ms(0);
+        let ts1 = now_plus_ms(100);
+        let ts2 = now_plus_ms(250);
+        assert_eq!(cache.append_chunk(b"aaa", ts0).unwrap(), 0);
+        assert_eq!(cache.append_chunk(b"bbbb", ts1).unwrap(), 1);
+        assert_eq!(cache.append_chunk(b"ccccc", ts2).unwrap(), 2);
         let chunks = cache.chunks_in_order().unwrap();
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].seq, 0);
-        assert_eq!(chunks[1].seq, 1);
-        assert_eq!(chunks[2].seq, 2);
+        assert_eq!(chunks[0].capture_started_at, ts0);
+        assert_eq!(chunks[1].capture_started_at, ts1);
+        assert_eq!(chunks[2].capture_started_at, ts2);
     }
 
     #[test]
     fn delete_removes_all_chunks() {
         let (_td, root) = root_with(7200);
         let mut cache = ParticipantCache::open(&root, "sess2", "pseudo2").unwrap();
-        cache.append_chunk(b"aaa").unwrap();
+        cache.append_chunk(b"aaa", now_plus_ms(0)).unwrap();
         assert!(cache.dir().exists());
         cache.delete().unwrap();
         assert!(!cache.dir().exists());
-        // Idempotent — second delete is fine.
         cache.delete().unwrap();
     }
 
@@ -359,9 +388,9 @@ mod tests {
     fn delete_session_removes_every_participant() {
         let (_td, root) = root_with(7200);
         let mut c1 = ParticipantCache::open(&root, "sess3", "p1").unwrap();
-        c1.append_chunk(b"aaaa").unwrap();
+        c1.append_chunk(b"aaaa", now_plus_ms(0)).unwrap();
         let mut c2 = ParticipantCache::open(&root, "sess3", "p2").unwrap();
-        c2.append_chunk(b"bbbb").unwrap();
+        c2.append_chunk(b"bbbb", now_plus_ms(0)).unwrap();
         assert!(root.session_dir("sess3").exists());
         delete_session(&root, "sess3").unwrap();
         assert!(!root.session_dir("sess3").exists());
@@ -369,23 +398,19 @@ mod tests {
 
     #[test]
     fn oldest_chunk_drops_when_cap_exceeded() {
-        // Tiny cap (10 bytes total) to exercise eviction without writing
-        // gigabytes of zeros.
         let td = TempDir::new().unwrap();
         let root = BufferRoot {
             root: td.path().to_path_buf(),
             max_bytes_per_participant: 10,
         };
         let mut cache = ParticipantCache::open(&root, "sess4", "p1").unwrap();
-        // Write 6 chunks of 4 bytes each = 24 bytes; should trim back to
-        // at most 10 bytes (i.e. keeping only the last 2 chunks).
-        for _ in 0..6 {
-            cache.append_chunk(&[1u8, 2, 3, 4]).unwrap();
+        for i in 0..6 {
+            cache
+                .append_chunk(&[1u8, 2, 3, 4], now_plus_ms(i * 10))
+                .unwrap();
         }
         let remaining = cache.chunks_in_order().unwrap();
         assert!(remaining.len() <= 3, "remaining: {}", remaining.len());
-        // The kept chunks must be the most recent ones (monotonically
-        // increasing seq numbers near the end).
         let seqs: Vec<u32> = remaining.iter().map(|c| c.seq).collect();
         assert_eq!(seqs, (6 - remaining.len() as u32..6).collect::<Vec<_>>());
     }
@@ -394,7 +419,7 @@ mod tests {
     fn sweep_on_startup_removes_stale_session_dirs() {
         let (td, root) = root_with(7200);
         let mut cache = ParticipantCache::open(&root, "old-sess", "p1").unwrap();
-        cache.append_chunk(b"aaa").unwrap();
+        cache.append_chunk(b"aaa", now_plus_ms(0)).unwrap();
         drop(cache);
         assert!(root.session_dir("old-sess").exists());
         sweep_on_startup(td.path());
@@ -405,63 +430,26 @@ mod tests {
     fn walk_total_bytes_sums_across_all_participants() {
         let (td, root) = root_with(7200);
         let mut c1 = ParticipantCache::open(&root, "s", "p1").unwrap();
-        c1.append_chunk(&[0u8; 5]).unwrap();
+        c1.append_chunk(&[0u8; 5], now_plus_ms(0)).unwrap();
         let mut c2 = ParticipantCache::open(&root, "s", "p2").unwrap();
-        c2.append_chunk(&[0u8; 7]).unwrap();
+        c2.append_chunk(&[0u8; 7], now_plus_ms(0)).unwrap();
         let total = walk_total_bytes(td.path()).unwrap();
         assert_eq!(total, 12);
     }
 
     #[test]
-    fn chunks_in_order_preserves_sequence_after_sparse_writes() {
-        // Simulates the flush-on-accept scan order: seq 0 written, seq 1
-        // written, seq 2 written, listing must come back in 0-1-2 order
-        // regardless of filesystem iteration order.
-        let (_td, root) = root_with(7200);
-        let mut c = ParticipantCache::open(&root, "sess", "p").unwrap();
-        c.append_chunk(b"first").unwrap();
-        c.append_chunk(b"second_payload").unwrap();
-        c.append_chunk(b"third_even_longer").unwrap();
-        let chunks = c.chunks_in_order().unwrap();
-        assert_eq!(
-            chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        // File sizes map back to the right seq.
-        assert_eq!(chunks[0].bytes, b"first".len() as u64);
-        assert_eq!(chunks[1].bytes, b"second_payload".len() as u64);
-        assert_eq!(chunks[2].bytes, b"third_even_longer".len() as u64);
+    fn chunk_filename_roundtrips_seq_and_timestamp() {
+        let ts = now_plus_ms(1_234);
+        let name = format!("chunk_{:06}_{}.pcm", 42, ts.timestamp_millis());
+        let (seq, ms) = parse_chunk_name(&name).unwrap();
+        assert_eq!(seq, 42);
+        assert_eq!(ms, ts.timestamp_millis());
     }
 
     #[test]
-    fn decline_path_deletes_participant_dir() {
-        // ParticipantCache::delete mirrors what the actor does on Decline.
-        let (_td, root) = root_with(7200);
-        let mut c = ParticipantCache::open(&root, "sess-dec", "p").unwrap();
-        c.append_chunk(b"bytes").unwrap();
-        let dir = c.dir().to_path_buf();
-        assert!(dir.exists());
-        c.delete().unwrap();
-        assert!(!dir.exists());
-    }
-
-    #[test]
-    fn flush_order_matches_write_order() {
-        // The flush-on-accept contract: cache stream order equals upload
-        // order. We verify this by listing the chunks in sequence order
-        // and comparing to the original write order.
-        let (_td, root) = root_with(7200);
-        let mut c = ParticipantCache::open(&root, "sess-flush", "p").unwrap();
-        let payloads: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; 10 + i]).collect();
-        for p in &payloads {
-            c.append_chunk(p).unwrap();
-        }
-        // Read chunks back via the public API used by flush_and_delete.
-        let chunks = c.chunks_in_order().unwrap();
-        assert_eq!(chunks.len(), payloads.len());
-        for (i, chunk) in chunks.iter().enumerate() {
-            let read_back = std::fs::read(&chunk.path).unwrap();
-            assert_eq!(read_back, payloads[i], "chunk {i} roundtrip");
-        }
+    fn pcm_bytes_to_duration_ms_handles_common_sizes() {
+        assert_eq!(pcm_bytes_to_duration_ms(192_000), 1_000);
+        assert_eq!(pcm_bytes_to_duration_ms(96_000), 500);
+        assert_eq!(pcm_bytes_to_duration_ms(0), 0);
     }
 }

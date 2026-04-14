@@ -1,9 +1,18 @@
 //! `/record` slash command.
 //!
-//! Spawns a per-guild actor, kicks off `Session::new`, and returns as soon as
-//! the handle is in the DashMap. The actor handles voice-join, stabilization,
-//! announcement, consent and finalization — this handler only assembles the
-//! initial Session + posts the consent embed via the [`respond`] wrapper.
+//! Per the locked spec (F2/F6), the bot does not talk to the data-api at all
+//! until the stabilization gate opens. This handler's job is narrow:
+//!
+//! 1. Validate the invoker is in a voice channel.
+//! 2. Build a `Session` with the voice-channel humans pre-enrolled as
+//!    Pending participants.
+//! 3. Spawn the per-guild actor.
+//! 4. Post the consent embed into the text channel.
+//!
+//! Blocklist checks, the `POST /internal/sessions` row insert, and the
+//! `participants/batch` insert all move into the actor's gate-open path.
+//! If the gate never opens (decline, timeout, /stop before gate), the
+//! data-api never hears about the session at all — that is intentional.
 
 use std::sync::Arc;
 
@@ -11,7 +20,7 @@ use serenity::all::*;
 use tracing::{error, info};
 
 use crate::commands::respond::{respond, InteractionReply};
-use crate::session::actor::{spawn_session, SessionCmd, SessionHandle};
+use crate::session::actor::{spawn_session, SessionCmd};
 use crate::session::Session;
 use crate::state::AppState;
 
@@ -35,9 +44,8 @@ async fn record_inner(
         );
     };
 
-    // Extract everything we need from the cache INSIDE a block so the
-    // `CacheRef` drops before our first `.await`. `CacheRef` contains a
-    // `dashmap` internal guard which is `!Send`.
+    // Extract voice-channel members INSIDE a block so the `CacheRef` drops
+    // before we `.await` — the dashmap guard it carries is `!Send`.
     let (channel_id, members) = {
         let Some(guild_arc) = ctx.cache.guild(guild_id) else {
             return InteractionReply::Edit(
@@ -92,20 +100,9 @@ async fn record_inner(
         }
     };
 
-    if let Err(e) = create_session_row(state, &session_id, guild_id.get()).await {
-        error!(error = %e, "create_session_failed");
-        let _ = handle.send(SessionCmd::AutoStop).await;
-        return InteractionReply::Edit(
-            EditInteractionResponse::new()
-                .content("Couldn't reach storage backend. Try `/record` again."),
-        );
-    }
-
-    if let Err(e) = enrol_members(state, &handle, &session_id, &members).await {
-        error!(error = %e, "enrol_members_failed");
-    }
-
-    // Render the first consent embed.
+    // Render the first consent embed. The actor has its own copy of the
+    // Session; we build a display-only one here so we don't reach into the
+    // actor's state from the handler.
     let mut display_session = Session::new(
         guild_id.get(),
         channel_id.get(),
@@ -151,91 +148,4 @@ async fn record_inner(
     }
 
     InteractionReply::Silent
-}
-
-async fn create_session_row(
-    state: &Arc<AppState>,
-    session_id: &str,
-    guild_id: u64,
-) -> Result<(), String> {
-    let session_uuid = uuid::Uuid::parse_str(session_id).map_err(|e| e.to_string())?;
-    let s3_prefix = format!("sessions/{}/{}", guild_id, session_id);
-    state
-        .api
-        .create_session(
-            session_uuid,
-            guild_id as i64,
-            chrono::Utc::now(),
-            None,
-            None,
-            Some(s3_prefix),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-async fn enrol_members(
-    state: &Arc<AppState>,
-    handle: &SessionHandle,
-    session_id: &str,
-    members: &[(UserId, String)],
-) -> Result<(), String> {
-    if members.is_empty() {
-        return Ok(());
-    }
-    let session_uuid = uuid::Uuid::parse_str(session_id).map_err(|e| e.to_string())?;
-
-    // Async follow-up #1: parallel blocklist checks via JoinSet.
-    let mut set: tokio::task::JoinSet<(usize, Result<bool, String>)> = tokio::task::JoinSet::new();
-    for (i, (uid, _)) in members.iter().enumerate() {
-        let api = state.api.clone();
-        let uid = uid.get();
-        set.spawn(async move {
-            (
-                i,
-                api.check_blocklist(uid).await.map_err(|e| e.to_string()),
-            )
-        });
-    }
-    let mut blocked = vec![false; members.len()];
-    while let Some(join_res) = set.join_next().await {
-        let (i, res) = match join_res {
-            Ok(v) => v,
-            Err(e) => return Err(format!("blocklist_join_error: {e}")),
-        };
-        blocked[i] = res?;
-    }
-
-    let allowed: Vec<(UserId, String)> = members
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (uid, name))| {
-            if blocked[i] {
-                info!(user_id = %uid, "participant_blocklisted — skip");
-                None
-            } else {
-                Some((*uid, name.clone()))
-            }
-        })
-        .collect();
-
-    let batch_input: Vec<(u64, bool, Option<String>)> = allowed
-        .iter()
-        .map(|(uid, name)| (uid.get(), false, Some(name.clone())))
-        .collect();
-    match state.api.add_participants_batch(session_uuid, &batch_input).await {
-        Ok(rows) => {
-            for ((uid, _), row) in allowed.iter().zip(rows.iter()) {
-                let _ = handle
-                    .send(SessionCmd::SetParticipantUuid {
-                        user_id: *uid,
-                        participant_uuid: row.id,
-                    })
-                    .await;
-            }
-        }
-        Err(e) => return Err(e.to_string()),
-    }
-    Ok(())
 }
