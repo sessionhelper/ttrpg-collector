@@ -36,10 +36,11 @@ pub struct SessionResponse {
 pub struct ParticipantResponse {
     pub id: Uuid,
     pub session_id: Uuid,
-    pub user_id: Option<Uuid>,
+    pub pseudo_id: String,
     pub consent_scope: Option<String>,
     pub consented_at: Option<DateTime<Utc>>,
-    pub withdrawn_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub data_wiped_at: Option<DateTime<Utc>>,
     pub mid_session_join: bool,
     pub no_llm_training: bool,
     pub no_public_release: bool,
@@ -48,10 +49,11 @@ pub struct ParticipantResponse {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct UserResponse {
-    pub id: Uuid,
-    pub discord_id_hash: String,
     pub pseudo_id: String,
-    pub global_opt_out: bool,
+    #[serde(default)]
+    pub is_admin: bool,
+    #[serde(default)]
+    pub data_wiped_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,18 +88,20 @@ struct UpdateSessionRequest {
 
 #[derive(Serialize)]
 struct CreateUserRequest {
-    discord_id_hash: String,
     pseudo_id: String,
 }
 
 #[derive(Serialize)]
+struct DisplayNameRequest {
+    display_name: String,
+    source: &'static str,
+}
+
+#[derive(Serialize)]
 struct AddParticipantRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_id: Option<Uuid>,
+    pseudo_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     mid_session_join: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -371,13 +375,35 @@ impl DataApiClient {
             .client
             .post(format!("{}/internal/users", self.base_url))
             .header("authorization", self.auth_header().await)
-            .json(&CreateUserRequest {
-                discord_id_hash: pseudo_id.clone(),
-                pseudo_id,
-            })
+            .json(&CreateUserRequest { pseudo_id })
             .send()
             .await?;
         Ok(check_status(resp).await?.json().await?)
+    }
+
+    /// Record a display name for a pseudo_id. Fire-and-forget error
+    /// handling — display names are an affordance, not a correctness
+    /// requirement, so a failure here doesn't block enrolment.
+    async fn record_display_name(
+        &self,
+        pseudo_id: &str,
+        display_name: &str,
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/internal/users/{}/display_names",
+                self.base_url, pseudo_id
+            ))
+            .header("authorization", self.auth_header().await)
+            .json(&DisplayNameRequest {
+                display_name: display_name.to_string(),
+                source: "bot",
+            })
+            .send()
+            .await?;
+        check_status(resp).await?;
+        Ok(())
     }
 
     /// Look up a participant row by (session_id, discord_user_id). This is
@@ -397,18 +423,19 @@ impl DataApiClient {
         let participants = self.list_participants(session_id).await?;
         participants
             .into_iter()
-            .find(|p| p.user_id == Some(user.id))
+            .find(|p| p.pseudo_id == user.pseudo_id)
             .ok_or_else(|| ApiError::Status {
                 status: 404,
                 body: "participant not found for user".to_string(),
             })
     }
 
-    /// Upsert a user and check if they're on the blocklist (replaces db::check_blocklist).
-    /// Returns true if the user has opted out globally.
+    /// Upsert a user and check if their data has been wiped (post-refactor
+    /// replacement for the old `global_opt_out` flag). `data_wiped_at`
+    /// being set means the user invoked self-deletion; treat as blocked.
     pub async fn check_blocklist(&self, discord_user_id: u64) -> Result<bool, ApiError> {
         let user = self.upsert_user(discord_user_id).await?;
-        Ok(user.global_opt_out)
+        Ok(user.data_wiped_at.is_some())
     }
 
     // --- Participants ---
@@ -422,6 +449,9 @@ impl DataApiClient {
         display_name: Option<String>,
     ) -> Result<ParticipantResponse, ApiError> {
         let user = self.upsert_user(discord_user_id).await?;
+        if let Some(name) = display_name.as_deref() {
+            let _ = self.record_display_name(&user.pseudo_id, name).await;
+        }
         let resp = self
             .client
             .post(format!(
@@ -430,9 +460,8 @@ impl DataApiClient {
             ))
             .header("authorization", self.auth_header().await)
             .json(&AddParticipantRequest {
-                user_id: Some(user.id),
+                pseudo_id: user.pseudo_id,
                 mid_session_join: Some(mid_session_join),
-                display_name,
             })
             .send()
             .await?;
@@ -455,10 +484,12 @@ impl DataApiClient {
         let mut requests = Vec::with_capacity(participants.len());
         for (discord_user_id, mid_session_join, display_name) in participants {
             let user = self.upsert_user(*discord_user_id).await?;
+            if let Some(name) = display_name.as_deref() {
+                let _ = self.record_display_name(&user.pseudo_id, name).await;
+            }
             requests.push(AddParticipantRequest {
-                user_id: Some(user.id),
+                pseudo_id: user.pseudo_id,
                 mid_session_join: Some(*mid_session_join),
-                display_name: display_name.clone(),
             });
         }
         let resp = self
