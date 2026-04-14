@@ -607,6 +607,12 @@ struct ActorEnv {
     buffer_root: BufferRoot,
     obs: AudioObservables,
     participants: HashMap<UserId, ParticipantChannel>,
+    /// Shared SSRC→participant-tx map the audio sink reads. Owned by the
+    /// env so late enrolments (harness `/enrol`, Discord join-mid-session)
+    /// can insert into the same DashMap the receiver is already routing
+    /// against — otherwise the sink's closure holds a snapshot taken at
+    /// attach time and late additions never receive packets.
+    packet_routes: Arc<DashMap<u64, mpsc::Sender<ParticipantCmd>>>,
     expected_user_ids: Arc<StdMutex<HashSet<u64>>>,
     #[allow(dead_code)]
     op5_rx: Option<mpsc::UnboundedReceiver<crate::voice::Op5Event>>,
@@ -682,6 +688,7 @@ async fn run_actor(
         buffer_root,
         obs: AudioObservables::new(),
         participants: HashMap::new(),
+        packet_routes: Arc::new(DashMap::new()),
         expected_user_ids: expected,
         op5_rx: None,
         audio_handle: None,
@@ -744,7 +751,7 @@ async fn join_voice_and_attach(env: &mut ActorEnv, session: &mut Session) -> Res
     }
 
     let mut call_lock = call.lock().await;
-    let (sink, _drop_rx) = build_sink_and_rx(&env.participants);
+    let (sink, _drop_rx) = build_sink_and_rx(&env.participants, env.packet_routes.clone());
     let (op5_tx, op5_rx_new) = mpsc::unbounded_channel();
     let audio_handle = AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), op5_tx);
     drop(call_lock);
@@ -754,10 +761,14 @@ async fn join_voice_and_attach(env: &mut ActorEnv, session: &mut Session) -> Res
     Ok(())
 }
 
+/// Build a sink that routes `AudioPacket`s to per-participant tasks via
+/// the supplied shared `routes` map. The Arc is cloned into the sink
+/// closure; the env keeps the other clone so later enrolments can insert
+/// into the same map without rebuilding the sink.
 fn build_sink_and_rx(
     participants: &HashMap<UserId, ParticipantChannel>,
+    routes: Arc<DashMap<u64, mpsc::Sender<ParticipantCmd>>>,
 ) -> (PacketSink, mpsc::UnboundedReceiver<crate::voice::Op5Event>) {
-    let routes: Arc<DashMap<u64, mpsc::Sender<ParticipantCmd>>> = Arc::new(DashMap::new());
     for (uid, ch) in participants {
         routes.insert(uid.get(), ch.tx.clone());
     }
@@ -942,6 +953,7 @@ async fn open_the_gate(env: &mut ActorEnv, session: &mut Session) -> Result<(), 
     for uid in &blocklisted {
         info!(user_id = %uid, "participant_blocklisted — dropping from session");
         session.participants.remove(uid);
+        env.packet_routes.remove(&uid.get());
         if let Some(ch) = env.participants.remove(uid) {
             let _ = ch.tx.send(ParticipantCmd::DropCache).await;
             let _ = ch.tx.send(ParticipantCmd::Shutdown).await;
@@ -1021,6 +1033,7 @@ async fn open_the_gate(env: &mut ActorEnv, session: &mut Session) -> Result<(), 
         .map(|(uid, _)| *uid)
         .collect();
     for uid in declined {
+        env.packet_routes.remove(&uid.get());
         if let Some(ch) = env.participants.remove(&uid) {
             let _ = ch.tx.send(ParticipantCmd::DropCache).await;
             let _ = ch.tx.send(ParticipantCmd::Shutdown).await;
@@ -1195,7 +1208,9 @@ fn collect_source_chunks(dir: &std::path::Path) -> Vec<SourceChunk> {
 async fn reattach_audio(env: &mut ActorEnv, session: &Session) {
     let Some(manager) = songbird::get(&env.ctx).await else { return };
     let Some(call) = manager.get(GuildId::new(session.guild_id)) else { return };
-    let (sink, _drop_rx) = build_sink_and_rx(&env.participants);
+    // On re-attach (heal path), the shared route map persists — we don't
+    // want to drop mappings for participants that are still enrolled.
+    let (sink, _drop_rx) = build_sink_and_rx(&env.participants, env.packet_routes.clone());
     let (op5_tx, op5_rx) = mpsc::unbounded_channel();
     let mut call_lock = call.lock().await;
     let new_handle = AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), op5_tx);
@@ -1448,6 +1463,11 @@ async fn apply_enrol(
         api: env.state.api.clone(),
         cancel: env.cancel.clone(),
     });
+    // Register with the shared sink route map so packets reach this
+    // participant. Without this, late enrolments are silently dropped at
+    // the sink because the audio receiver's closure is populated once at
+    // session start.
+    env.packet_routes.insert(user_id.get(), ch.tx.clone());
     env.participants.insert(user_id, ch);
 
     recompute_humans_and_auto_stop_timer(env, session);
