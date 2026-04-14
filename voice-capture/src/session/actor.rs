@@ -989,6 +989,28 @@ async fn open_the_gate(env: &mut ActorEnv, session: &mut Session) -> Result<(), 
         session.set_participant_uuid(*uid, row.id);
     }
 
+    // Flush any pre-gate consents to data-api. add_participants_batch
+    // only carries pseudo_id + mid_session_join; consent_scope is a
+    // separate PATCH. Without this, participants who consented before
+    // the gate opened stay at consent_scope=null in the DB and the
+    // worker filter (scope == "full") drops their tracks.
+    for (uid, row) in uid_order.iter().zip(rows.iter()) {
+        let scope = session.participants.get(uid).and_then(|p| p.scope);
+        let Some(scope) = scope else { continue };
+        let scope_str = match scope {
+            ConsentScope::Full => "full",
+            ConsentScope::Decline => "decline",
+        };
+        let api = env.state.api.clone();
+        let pid = row.id;
+        let scope_owned = scope_str.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = api.record_consent_by_id(pid, &scope_owned).await {
+                error!("pre-gate consent flush failed: {e}");
+            }
+        });
+    }
+
     // Delete any per-speaker cache for an already-Declined participant and
     // drop their task. Collect the surviving participants' cache dirs for
     // mix rendering.
