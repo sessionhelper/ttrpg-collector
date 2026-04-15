@@ -1026,6 +1026,12 @@ async fn wait_for_gate(
                 }
             }
             _ = poll.tick() => {
+                // Solo-speaker SSRC inference: if only one non-bot human is
+                // in the voice channel and we're seeing unmapped audio, the
+                // mapping is unambiguous even without OP5. Without this, a
+                // user who started speaking BEFORE the bot's voice-WS finished
+                // handshaking never gets an OP5 and stabilization times out.
+                env.obs.infer_solo_speaker(&env.humans_in_channel);
                 let verdict = stabilization::evaluate(gate_inputs);
                 match tracker.observe(verdict) {
                     StreakStatus::GateOpens { total_secs } => {

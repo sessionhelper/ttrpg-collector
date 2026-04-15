@@ -71,6 +71,48 @@ impl AudioObservables {
             s.clear();
         }
     }
+
+    /// Backfill SSRC→user mappings when there is exactly one non-bot human
+    /// in the voice channel and we're already seeing audio from unmapped
+    /// SSRCs. Covers the case where Discord's OP5 `SpeakingStateUpdate`
+    /// never fires because the user was already talking before the bot's
+    /// voice-WS handshake completed.
+    ///
+    /// Safe to call repeatedly (on every stabilization poll tick). If a
+    /// real OP5 arrives later we keep the inferred mapping; it'll match
+    /// what the real OP5 would have written anyway (single candidate).
+    ///
+    /// Returns how many SSRCs were inferred on this call.
+    pub fn infer_solo_speaker(&self, humans_in_channel: &HashSet<serenity::all::UserId>) -> usize {
+        if humans_in_channel.len() != 1 {
+            return 0;
+        }
+        let only_human = match humans_in_channel.iter().next() {
+            Some(u) => u.get(),
+            None => return 0,
+        };
+        let seen_snapshot: HashSet<u32> = match self.ssrcs_seen.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => return 0,
+        };
+        let Ok(mut map) = self.ssrc_map.lock() else {
+            return 0;
+        };
+        let mut inferred = 0;
+        for ssrc in seen_snapshot {
+            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(ssrc) {
+                e.insert(only_human);
+                inferred += 1;
+                info!(
+                    ssrc,
+                    user_id = only_human,
+                    "ssrc_inferred_solo_speaker (no OP5 observed)"
+                );
+                metrics::counter!("chronicle_ssrc_solo_inferences_total").increment(1);
+            }
+        }
+        inferred
+    }
 }
 
 impl Default for AudioObservables {
@@ -394,6 +436,72 @@ mod streak_tests {
             bump_streak_crossed(&mut s, 2, 100),
             "ssrc 2 100th bump should cross independently"
         );
+    }
+}
+
+#[cfg(test)]
+mod infer_solo_tests {
+    use super::*;
+    use serenity::all::UserId;
+
+    fn uid_set(ids: &[u64]) -> HashSet<UserId> {
+        ids.iter().copied().map(UserId::new).collect()
+    }
+
+    fn seed_seen(obs: &AudioObservables, ssrcs: &[u32]) {
+        let mut s = obs.ssrcs_seen.lock().unwrap();
+        for ssrc in ssrcs {
+            s.insert(*ssrc);
+        }
+    }
+
+    #[test]
+    fn infers_when_exactly_one_human() {
+        let obs = AudioObservables::new();
+        seed_seen(&obs, &[111, 222]);
+        let inferred = obs.infer_solo_speaker(&uid_set(&[42]));
+        assert_eq!(inferred, 2);
+        let map = obs.ssrc_map.lock().unwrap();
+        assert_eq!(map.get(&111), Some(&42));
+        assert_eq!(map.get(&222), Some(&42));
+    }
+
+    #[test]
+    fn abstains_with_zero_humans() {
+        let obs = AudioObservables::new();
+        seed_seen(&obs, &[111]);
+        assert_eq!(obs.infer_solo_speaker(&uid_set(&[])), 0);
+        assert!(obs.ssrc_map.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn abstains_with_multiple_humans() {
+        let obs = AudioObservables::new();
+        seed_seen(&obs, &[111]);
+        assert_eq!(obs.infer_solo_speaker(&uid_set(&[1, 2])), 0);
+        assert!(obs.ssrc_map.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn does_not_overwrite_existing_mappings() {
+        let obs = AudioObservables::new();
+        obs.ssrc_map.lock().unwrap().insert(111, 999);
+        seed_seen(&obs, &[111, 222]);
+        let inferred = obs.infer_solo_speaker(&uid_set(&[42]));
+        assert_eq!(inferred, 1, "only 222 should be inferred — 111 already mapped");
+        let map = obs.ssrc_map.lock().unwrap();
+        assert_eq!(map.get(&111), Some(&999), "existing mapping wins");
+        assert_eq!(map.get(&222), Some(&42));
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let obs = AudioObservables::new();
+        seed_seen(&obs, &[111]);
+        let humans = uid_set(&[42]);
+        assert_eq!(obs.infer_solo_speaker(&humans), 1);
+        assert_eq!(obs.infer_solo_speaker(&humans), 0, "nothing left to infer");
+        assert_eq!(obs.infer_solo_speaker(&humans), 0);
     }
 }
 
