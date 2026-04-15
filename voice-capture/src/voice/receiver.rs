@@ -262,39 +262,139 @@ impl AudioReceiver {
         let Ok(mut streaks) = self.silent_streaks.lock() else {
             return;
         };
-        let count = streaks.entry(ssrc).or_insert(0);
-        *count += 1;
-        // Fire heal request exactly when we cross the threshold; the
-        // actor side debounces, so spamming ourselves on every later
-        // tick would just mean wasted channel sends. Reset once we've
-        // fired so a subsequent re-cross can re-fire if heal didn't help.
-        if *count == DAVE_HEAL_THRESHOLD_TICKS {
-            let user_id = ssrc_map.get(&ssrc).copied().unwrap_or(0);
-            warn!(
-                ssrc, user_id,
-                consecutive = *count,
-                "dave_heal_requested — N consecutive undecoded packets"
-            );
-            metrics::counter!("chronicle_dave_heal_requests_total").increment(1);
-            let _ = self.heal_tx.send(DaveHealRequest {
-                ssrc,
-                user_id,
-                consecutive_silent: *count,
-            });
-            // Don't reset here — actor decides when the heal completes
-            // and resets via `AudioObservables::reset()` or by attaching
-            // a fresh `AudioReceiver`.
+        if !bump_streak_crossed(&mut streaks, ssrc, DAVE_HEAL_THRESHOLD_TICKS) {
+            return;
         }
+        let count = streaks.get(&ssrc).copied().unwrap_or(0);
+        let user_id = ssrc_map.get(&ssrc).copied().unwrap_or(0);
+        warn!(
+            ssrc, user_id, consecutive = count,
+            "dave_heal_requested — N consecutive undecoded packets"
+        );
+        metrics::counter!("chronicle_dave_heal_requests_total").increment(1);
+        let _ = self.heal_tx.send(DaveHealRequest {
+            ssrc,
+            user_id,
+            consecutive_silent: count,
+        });
+        // Don't reset here — the actor's heal consumer decides when the
+        // heal completes and resets via `AudioObservables::reset()` or
+        // by attaching a fresh `AudioReceiver` (which constructs new
+        // streak storage).
     }
 
     fn reset_silent_streak(&self, ssrc: u32) {
         if let Ok(mut streaks) = self.silent_streaks.lock() {
-            // Only write when there was actually a streak to clear,
-            // avoiding map churn for the common case of healthy SSRCs.
-            if streaks.get(&ssrc).copied().unwrap_or(0) > 0 {
-                streaks.insert(ssrc, 0);
-            }
+            reset_streak(&mut streaks, ssrc);
         }
+    }
+}
+
+/// Pure: bump the streak for `ssrc` and return `true` iff this call
+/// just crossed (or re-crossed) the threshold. Extracted so the heal
+/// trigger can be unit-tested without standing up a `songbird::Call`
+/// (`VoiceTick` is `#[non_exhaustive]` so it can't be constructed
+/// from outside the songbird crate).
+fn bump_streak_crossed(
+    streaks: &mut HashMap<u32, u64>,
+    ssrc: u32,
+    threshold: u64,
+) -> bool {
+    let count = streaks.entry(ssrc).or_insert(0);
+    let was_below = *count < threshold;
+    *count += 1;
+    was_below && *count >= threshold
+}
+
+/// Pure: clear the streak for `ssrc`. No-op if it was already zero, to
+/// keep the map free of churn for healthy SSRCs.
+fn reset_streak(streaks: &mut HashMap<u32, u64>, ssrc: u32) {
+    if streaks.get(&ssrc).copied().unwrap_or(0) > 0 {
+        streaks.insert(ssrc, 0);
+    }
+}
+
+#[cfg(test)]
+mod streak_tests {
+    use super::*;
+
+    #[test]
+    fn bump_returns_false_until_threshold() {
+        let mut s: HashMap<u32, u64> = HashMap::new();
+        for i in 1..100 {
+            assert!(!bump_streak_crossed(&mut s, 1, 100), "iteration {i}");
+        }
+    }
+
+    #[test]
+    fn bump_returns_true_exactly_at_threshold() {
+        let mut s: HashMap<u32, u64> = HashMap::new();
+        for _ in 1..100 {
+            bump_streak_crossed(&mut s, 1, 100);
+        }
+        assert!(
+            bump_streak_crossed(&mut s, 1, 100),
+            "100th bump should cross"
+        );
+    }
+
+    #[test]
+    fn bump_after_threshold_returns_false_until_reset() {
+        let mut s: HashMap<u32, u64> = HashMap::new();
+        for _ in 0..100 {
+            bump_streak_crossed(&mut s, 1, 100);
+        }
+        // Already crossed; subsequent bumps must NOT keep firing — the
+        // actor debounces but we also don't want the receiver hammering
+        // the channel every 20ms.
+        for i in 0..50 {
+            assert!(
+                !bump_streak_crossed(&mut s, 1, 100),
+                "post-threshold bump {i} should not re-cross"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_then_bump_can_recross() {
+        let mut s: HashMap<u32, u64> = HashMap::new();
+        for _ in 0..100 {
+            bump_streak_crossed(&mut s, 1, 100);
+        }
+        reset_streak(&mut s, 1);
+        for i in 1..100 {
+            assert!(!bump_streak_crossed(&mut s, 1, 100), "post-reset {i}");
+        }
+        assert!(
+            bump_streak_crossed(&mut s, 1, 100),
+            "100 bumps after reset should re-cross"
+        );
+    }
+
+    #[test]
+    fn reset_on_unseen_ssrc_is_noop() {
+        let mut s: HashMap<u32, u64> = HashMap::new();
+        reset_streak(&mut s, 999);
+        assert!(s.is_empty(), "reset must not insert on unseen SSRC");
+    }
+
+    #[test]
+    fn streaks_are_per_ssrc() {
+        let mut s: HashMap<u32, u64> = HashMap::new();
+        for _ in 0..50 {
+            bump_streak_crossed(&mut s, 1, 100);
+        }
+        // SSRC 2 starts fresh — 50 bumps on 1 don't help 2.
+        for i in 1..100 {
+            assert!(
+                !bump_streak_crossed(&mut s, 2, 100),
+                "ssrc 2 iteration {i}"
+            );
+        }
+        assert!(
+            bump_streak_crossed(&mut s, 2, 100),
+            "ssrc 2 100th bump should cross independently"
+        );
     }
 }
 
