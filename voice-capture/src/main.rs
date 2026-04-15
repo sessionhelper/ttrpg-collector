@@ -32,8 +32,45 @@ use crate::api_client::DataApiClient;
 use crate::config::Config;
 use crate::state::AppState;
 
+/// Ring buffer of recently-seen interaction IDs.
+///
+/// Protects against serenity gateway RESUME replaying an interaction we
+/// already processed — Discord would then return 404 `Unknown interaction`
+/// on our second ack attempt. We can't stop the replay (it lives inside
+/// serenity), but we can recognise duplicates by ID and skip them.
+///
+/// Snowflake IDs are globally unique across Discord, so a seen-before ID
+/// is unambiguously a replay; no risk of dropping legitimate work.
+///
+/// Capacity 128 ≈ 5 s of peak interaction traffic for a small guild.
+const RECENT_INTERACTION_CAPACITY: usize = 128;
+
+#[derive(Default)]
+struct RecentInteractions {
+    ids: std::sync::Mutex<std::collections::VecDeque<u64>>,
+}
+
+impl RecentInteractions {
+    /// Record `id`. Returns `true` if this is the first time we've seen it
+    /// (and the caller should proceed); `false` if it's a duplicate replay.
+    fn record(&self, id: u64) -> bool {
+        let Ok(mut q) = self.ids.lock() else {
+            return true;
+        };
+        if q.contains(&id) {
+            return false;
+        }
+        if q.len() >= RECENT_INTERACTION_CAPACITY {
+            q.pop_front();
+        }
+        q.push_back(id);
+        true
+    }
+}
+
 struct Handler {
     state: Arc<AppState>,
+    recent: Arc<RecentInteractions>,
 }
 
 #[async_trait]
@@ -63,6 +100,15 @@ impl EventHandler for Handler {
                 let state = self.state.clone();
                 let cmd_name = command.data.name.clone();
                 let interaction_id = command.id.get();
+                if !self.recent.record(interaction_id) {
+                    info!(
+                        interaction_id,
+                        command = %cmd_name,
+                        "skipping duplicate interaction (gateway resume replay)"
+                    );
+                    metrics::counter!("chronicle_interactions_deduped_total").increment(1);
+                    return;
+                }
                 // Discord snowflake → created-at lag tells us how stale the
                 // interaction was by the time our gateway delivered it.
                 // If this is > 2800ms we're racing the 3s ack window.
@@ -95,6 +141,16 @@ impl EventHandler for Handler {
             }
             Interaction::Component(component) => {
                 let state = self.state.clone();
+                let component_id = component.id.get();
+                if !self.recent.record(component_id) {
+                    info!(
+                        interaction_id = component_id,
+                        custom_id = %component.data.custom_id,
+                        "skipping duplicate component click (gateway resume replay)"
+                    );
+                    metrics::counter!("chronicle_interactions_deduped_total").increment(1);
+                    return;
+                }
                 tokio::spawn(async move {
                     if let Err(e) =
                         commands::consent::handle_consent_button(&ctx, &component, &state).await
@@ -206,6 +262,7 @@ async fn main() {
 
     let handler = Handler {
         state: state.clone(),
+        recent: Arc::new(RecentInteractions::default()),
     };
 
     let client_builder = Client::builder(&token, intents).event_handler(handler);
@@ -215,5 +272,49 @@ async fn main() {
 
     if let Err(e) = client.start().await {
         error!(error = %e, "client_error");
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    #[test]
+    fn first_record_returns_true() {
+        let r = RecentInteractions::default();
+        assert!(r.record(42));
+    }
+
+    #[test]
+    fn duplicate_record_returns_false() {
+        let r = RecentInteractions::default();
+        assert!(r.record(42));
+        assert!(!r.record(42), "replay should be deduped");
+        assert!(!r.record(42), "second replay still deduped");
+    }
+
+    #[test]
+    fn distinct_ids_all_accepted() {
+        let r = RecentInteractions::default();
+        for i in 0..50 {
+            assert!(r.record(i), "id {i} first-seen");
+        }
+    }
+
+    #[test]
+    fn eviction_past_capacity() {
+        let r = RecentInteractions::default();
+        for i in 0..(RECENT_INTERACTION_CAPACITY as u64) {
+            r.record(i);
+        }
+        // id 0 is still in the window.
+        assert!(!r.record(0));
+        // Push one more, evicting 0.
+        assert!(r.record(999));
+        // Now 0 is outside the window; a replay is accepted again.
+        assert!(
+            r.record(0),
+            "once evicted, id 0 is treated as fresh — acceptable trade-off for bounded memory"
+        );
     }
 }
