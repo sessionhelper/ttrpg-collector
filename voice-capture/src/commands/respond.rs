@@ -25,7 +25,7 @@ use std::time::Instant;
 use serenity::all::{
     CommandInteraction, ComponentInteraction, Context, CreateActionRow, CreateEmbed,
     CreateInteractionResponse, CreateInteractionResponseFollowup,
-    CreateInteractionResponseMessage, EditInteractionResponse, EditMessage,
+    CreateInteractionResponseMessage, EditInteractionResponse,
 };
 
 /// The set of responses a handler can choose to return from its closure.
@@ -179,15 +179,13 @@ impl Interactionable for ComponentInteraction {
         &'a self,
         ctx: &'a Context,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), serenity::Error>> + Send + 'a>> {
-        // `DeferUpdateMessage` commits to editing the ORIGINAL message
-        // (the one carrying the button) via the interaction webhook once
-        // the handler finishes. Crucially this path works on EPHEMERAL
-        // messages — `Acknowledge` + `channel.edit_message` does not
-        // (ephemerals 404 on channel endpoints, yielding "Unknown
-        // Message"). The consent embed ships as an ephemeral reply to
-        // `/record`, so this difference is load-bearing.
+        // `Acknowledge` here serializes to Discord type-6
+        // `DEFERRED_UPDATE_MESSAGE` — bot acknowledges the click without
+        // showing the user a thinking indicator, and commits to editing
+        // the ORIGINAL message via the interaction webhook later. We do
+        // that follow-up edit in `update_message` below.
         Box::pin(async move {
-            self.create_response(&ctx.http, CreateInteractionResponse::DeferUpdateMessage)
+            self.create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
                 .await
         })
     }
