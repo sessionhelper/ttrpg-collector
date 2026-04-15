@@ -75,5 +75,5 @@ jobs:
             mv /opt/ovp/docker-compose.yml.new /opt/ovp/docker-compose.yml
             cd /opt/ovp
             docker compose pull collector
-            systemctl restart chronicle-data-api
+            docker compose up -d collector
             docker image prune -f

@@ -95,7 +95,6 @@ struct TickCounters {
     silent_packets: AtomicU64,
     unmapped_ssrc: AtomicU64,
     packets_forwarded: AtomicU64,
-    last_log_tick: AtomicU64,
 }
 
 /// One-shot signal that DAVE decryption appears to be stuck for one or more
