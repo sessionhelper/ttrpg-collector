@@ -588,6 +588,39 @@ mod inference_tests {
         let inferred = obs.infer_ssrc_mappings(&uid_set(&[1, 2, 3]));
         assert_eq!(inferred, 0);
     }
+
+    // --- End-to-end: inference → gate transitions Unhealthy → Healthy ---
+
+    #[test]
+    fn inference_flips_gate_verdict_from_unhealthy_to_healthy() {
+        use crate::session::stabilization::{evaluate, GateInputs, GateVerdict};
+
+        let obs = AudioObservables::new();
+        seed_seen(&obs, &[111]);
+        let expected: HashSet<u64> = [42u64].into_iter().collect();
+        let expected_user_ids = Arc::new(StdMutex::new(expected));
+
+        let inputs = GateInputs {
+            ssrcs_seen: obs.ssrcs_seen.clone(),
+            ssrc_map: obs.ssrc_map.clone(),
+            expected_user_ids: expected_user_ids.clone(),
+        };
+
+        assert_eq!(
+            evaluate(&inputs),
+            GateVerdict::Unhealthy,
+            "pre-inference: SSRC seen but unmapped → unhealthy"
+        );
+
+        let inferred = obs.infer_ssrc_mappings(&uid_set(&[42]));
+        assert_eq!(inferred, 1);
+
+        assert_eq!(
+            evaluate(&inputs),
+            GateVerdict::Healthy,
+            "post-inference: SSRC mapped to expected user → healthy"
+        );
+    }
 }
 
 struct SpeakingTracker {
