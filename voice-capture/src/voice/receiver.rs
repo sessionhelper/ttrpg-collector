@@ -416,9 +416,7 @@ impl VoiceEventHandler for SpeakingTracker {
             speaking = ?s.speaking,
             "op5_raw"
         );
-        let Some(uid) = s.user_id else {
-            return None;
-        };
+        let uid = s.user_id?;
         let is_new = if let Ok(mut map) = self.ssrc_to_user.lock() {
             map.insert(s.ssrc, uid.0).is_none()
         } else {

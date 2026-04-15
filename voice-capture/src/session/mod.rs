@@ -397,7 +397,7 @@ mod tests {
         let participants = parsed["participants"].as_object().unwrap();
         assert_eq!(participants.len(), 3);
         for k in participants.keys() {
-            assert_eq!(k.len(), 16);
+            assert_eq!(k.len(), 24);
         }
     }
 }
