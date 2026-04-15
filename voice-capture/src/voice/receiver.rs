@@ -98,6 +98,29 @@ struct TickCounters {
     last_log_tick: AtomicU64,
 }
 
+/// One-shot signal that DAVE decryption appears to be stuck for one or more
+/// SSRCs — the session actor consumes this on a debounced channel and
+/// fires the same heal cycle that `session::heal::check_and_heal` runs
+/// for the gate-failure path.
+#[derive(Debug, Clone, Copy)]
+pub struct DaveHealRequest {
+    pub ssrc: u32,
+    pub user_id: u64,
+    pub consecutive_silent: u64,
+}
+
+/// Per-SSRC silent-packet streaks. Bumped on `decoded_voice == None`,
+/// reset on a successful decode. Crossing the threshold below fires a
+/// `DaveHealRequest`. Wrapped in `Arc<Mutex>` because the VoiceTick
+/// handler is `&self` but the map needs interior mutability.
+type SilentStreaks = Arc<StdMutex<HashMap<u32, u64>>>;
+
+/// How many consecutive silent decodes (per SSRC) before we suspect DAVE
+/// decryption is broken and request a heal. ~50 ticks/sec → 100 = 2s,
+/// long enough that genuine pauses don't trigger but short enough that
+/// real broken DAVE sessions get healed inside a single utterance.
+pub const DAVE_HEAL_THRESHOLD_TICKS: u64 = 100;
+
 /// The session actor calls this once per heal-cycle attach. `ssrc_map` and
 /// `ssrcs_seen` are Arc'd so the gate-watcher task can observe them in
 /// parallel with the VoiceTick handler.
@@ -105,6 +128,11 @@ pub struct AudioReceiver {
     sink: PacketSink,
     obs: AudioObservables,
     counters: Arc<TickCounters>,
+    silent_streaks: SilentStreaks,
+    /// Where to send `DaveHealRequest`s. Unbounded because heal-fire
+    /// frequency is bounded above by the session actor's debounce
+    /// (one heal per 30s typical), so we never produce a backlog.
+    heal_tx: mpsc::UnboundedSender<DaveHealRequest>,
 }
 
 impl AudioReceiver {
@@ -113,13 +141,17 @@ impl AudioReceiver {
         sink: PacketSink,
         obs: AudioObservables,
         op5_tx: mpsc::UnboundedSender<Op5Event>,
+        heal_tx: mpsc::UnboundedSender<DaveHealRequest>,
     ) -> AudioHandle {
         let close = Arc::new(tokio::sync::Notify::new());
         let counters = Arc::new(TickCounters::default());
+        let silent_streaks: SilentStreaks = Arc::new(StdMutex::new(HashMap::new()));
         let receiver = Self {
             sink,
             obs: obs.clone(),
             counters: counters.clone(),
+            silent_streaks,
+            heal_tx,
         };
         call.add_global_event(CoreEvent::VoiceTick.into(), receiver);
         let tracker = SpeakingTracker {
@@ -199,8 +231,11 @@ impl VoiceEventHandler for AudioReceiver {
                 if n <= 3 {
                     warn!(ssrc, "voice_tick_no_decoded (DAVE decrypt fail or silent)");
                 }
+                self.bump_silent_streak(ssrc, &ssrc_map);
                 continue;
             };
+            // Successful decode → reset the per-SSRC silent streak.
+            self.reset_silent_streak(ssrc);
             self.counters.decoded_packets.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut s) = self.obs.ssrcs_seen.lock()
                 && s.insert(ssrc)
@@ -219,6 +254,47 @@ impl VoiceEventHandler for AudioReceiver {
             (self.sink)(AudioPacket { ssrc, user_id, samples: decoded.clone() });
         }
         None
+    }
+}
+
+impl AudioReceiver {
+    fn bump_silent_streak(&self, ssrc: u32, ssrc_map: &HashMap<u32, u64>) {
+        let Ok(mut streaks) = self.silent_streaks.lock() else {
+            return;
+        };
+        let count = streaks.entry(ssrc).or_insert(0);
+        *count += 1;
+        // Fire heal request exactly when we cross the threshold; the
+        // actor side debounces, so spamming ourselves on every later
+        // tick would just mean wasted channel sends. Reset once we've
+        // fired so a subsequent re-cross can re-fire if heal didn't help.
+        if *count == DAVE_HEAL_THRESHOLD_TICKS {
+            let user_id = ssrc_map.get(&ssrc).copied().unwrap_or(0);
+            warn!(
+                ssrc, user_id,
+                consecutive = *count,
+                "dave_heal_requested — N consecutive undecoded packets"
+            );
+            metrics::counter!("chronicle_dave_heal_requests_total").increment(1);
+            let _ = self.heal_tx.send(DaveHealRequest {
+                ssrc,
+                user_id,
+                consecutive_silent: *count,
+            });
+            // Don't reset here — actor decides when the heal completes
+            // and resets via `AudioObservables::reset()` or by attaching
+            // a fresh `AudioReceiver`.
+        }
+    }
+
+    fn reset_silent_streak(&self, ssrc: u32) {
+        if let Ok(mut streaks) = self.silent_streaks.lock() {
+            // Only write when there was actually a streak to clear,
+            // avoiding map churn for the common case of healthy SSRCs.
+            if streaks.get(&ssrc).copied().unwrap_or(0) > 0 {
+                streaks.insert(ssrc, 0);
+            }
+        }
     }
 }
 

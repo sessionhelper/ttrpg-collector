@@ -39,7 +39,7 @@ use serenity::all::*;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn, Instrument};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::api_client::DataApiClient;
 use crate::session::participant::ParticipantState;
@@ -56,7 +56,7 @@ use crate::voice::mixer::{
     render_mix_from_caches, write_mix_chunks_to_cache, LiveMixAccum, MixChunk, PerSpeakerSource,
     SourceChunk,
 };
-use crate::voice::{AudioHandle, AudioObservables, AudioPacket, AudioReceiver, PacketSink};
+use crate::voice::{AudioHandle, AudioObservables, AudioPacket, AudioReceiver, DaveHealRequest, PacketSink};
 
 // ---------------------------------------------------------------------------
 // Errors + command types
@@ -789,12 +789,88 @@ async fn join_voice_and_attach(env: &mut ActorEnv, session: &mut Session) -> Res
     let mut call_lock = call.lock().await;
     let (sink, _drop_rx) = build_sink_and_rx(&env.participants, env.packet_routes.clone());
     let (op5_tx, op5_rx_new) = mpsc::unbounded_channel();
-    let audio_handle = AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), op5_tx);
+    let (heal_tx, heal_rx) = mpsc::unbounded_channel();
+    let audio_handle =
+        AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), op5_tx, heal_tx);
     drop(call_lock);
 
+    spawn_dave_heal_consumer(env, session, heal_rx);
     env.audio_handle = Some(audio_handle);
     env.op5_rx = Some(op5_rx_new);
     Ok(())
+}
+
+/// Background task: debounces `DaveHealRequest`s and fires the songbird
+/// leave/join heal cycle (re-using the same primitives `session::heal`
+/// uses for the gate-failure path). The receiver fires a request the
+/// moment it sees DAVE_HEAL_THRESHOLD_TICKS consecutive undecoded
+/// packets for any SSRC; we cap heal frequency at one per
+/// `DAVE_HEAL_DEBOUNCE` to leave room for the rejoin to take effect
+/// before we'd retry.
+fn spawn_dave_heal_consumer(
+    env: &ActorEnv,
+    session: &Session,
+    mut heal_rx: mpsc::UnboundedReceiver<DaveHealRequest>,
+) {
+    const DAVE_HEAL_DEBOUNCE: Duration = Duration::from_secs(30);
+
+    let cancel = env.cancel.clone();
+    let ctx = env.ctx.clone();
+    let obs = env.obs.clone();
+    let guild_id = GuildId::new(session.guild_id);
+    let channel_id = ChannelId::new(session.channel_id);
+
+    tokio::spawn(async move {
+        let mut last_heal: Option<std::time::Instant> = None;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("dave_heal_consumer_exiting (session shutdown)");
+                    return;
+                }
+                req = heal_rx.recv() => {
+                    let Some(req) = req else { return };
+                    if let Some(prev) = last_heal
+                        && prev.elapsed() < DAVE_HEAL_DEBOUNCE
+                    {
+                        debug!(
+                            ssrc = req.ssrc,
+                            elapsed_ms = prev.elapsed().as_millis() as u64,
+                            "dave_heal_debounced"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        ssrc = req.ssrc,
+                        user_id = req.user_id,
+                        consecutive_silent = req.consecutive_silent,
+                        "dave_heal_firing — leave + rejoin to reset DAVE epoch"
+                    );
+                    last_heal = Some(std::time::Instant::now());
+                    metrics::counter!("chronicle_dave_heal_fired_total").increment(1);
+
+                    let Some(manager) = songbird::get(&ctx).await else {
+                        warn!("dave_heal: songbird manager missing");
+                        continue;
+                    };
+                    let _ = manager.leave(guild_id).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    obs.reset();
+                    match manager.join(guild_id, channel_id).await {
+                        Ok(_) => info!("dave_heal_rejoined"),
+                        Err(e) => warn!(error = %e, "dave_heal_rejoin_failed"),
+                    }
+                    // NOTE: The caller of `join_voice_and_attach` /
+                    // `reattach_audio` is responsible for re-attaching
+                    // the AudioReceiver after a heal. For now we rely
+                    // on the post-rejoin SpeakingStateUpdate flood to
+                    // re-populate ssrc_map; a deeper rework that
+                    // reuses `reattach_audio` from this task is in the
+                    // followup list.
+                }
+            }
+        }
+    });
 }
 
 /// Build a sink that routes `AudioPacket`s to per-participant tasks via
@@ -1264,9 +1340,12 @@ async fn reattach_audio(env: &mut ActorEnv, session: &Session) {
     // want to drop mappings for participants that are still enrolled.
     let (sink, _drop_rx) = build_sink_and_rx(&env.participants, env.packet_routes.clone());
     let (op5_tx, op5_rx) = mpsc::unbounded_channel();
+    let (heal_tx, heal_rx) = mpsc::unbounded_channel();
     let mut call_lock = call.lock().await;
-    let new_handle = AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), op5_tx);
+    let new_handle =
+        AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), op5_tx, heal_tx);
     drop(call_lock);
+    spawn_dave_heal_consumer(env, session, heal_rx);
     env.audio_handle = Some(new_handle);
     env.op5_rx = Some(op5_rx);
 }
