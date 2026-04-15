@@ -63,12 +63,24 @@ impl EventHandler for Handler {
                 let state = self.state.clone();
                 let cmd_name = command.data.name.clone();
                 let interaction_id = command.id.get();
+                // Discord snowflake → created-at lag tells us how stale the
+                // interaction was by the time our gateway delivered it.
+                // If this is > 2800ms we're racing the 3s ack window.
+                let discord_created_ms = (interaction_id >> 22) + 1420070400000;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let gateway_lag_ms = now_ms.saturating_sub(discord_created_ms);
+                let token_prefix: String = command.token.chars().take(8).collect();
                 tokio::spawn(async move {
                     let spawn_delay_us = received_at.elapsed().as_micros();
                     tracing::info!(
                         interaction_id,
                         command = %cmd_name,
                         spawn_delay_us,
+                        gateway_lag_ms,
+                        token_prefix = %token_prefix,
                         "interaction_handler_entered"
                     );
                     let result = match cmd_name.as_str() {
@@ -77,7 +89,7 @@ impl EventHandler for Handler {
                         _ => Ok(()),
                     };
                     if let Err(e) = result {
-                        error!(error = %e, interaction_id, "command_error");
+                        error!(error = ?e, interaction_id, gateway_lag_ms, "command_error");
                     }
                 });
             }
