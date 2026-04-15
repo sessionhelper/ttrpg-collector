@@ -35,6 +35,19 @@ test("`/record` → click Accept → participant consent_scope flips to 'full'",
 
   await runSlashCommand(page, input, "record");
 
+  // Bot's /record bails with "You need to be in a voice channel." if the
+  // test account isn't joined. Catch that early with a clearer message
+  // than a 15-second toBeVisible timeout on the Accept button.
+  const voiceWarning = page.locator(
+    'article:has-text("You need to be in a voice channel"), li:has-text("You need to be in a voice channel")',
+  );
+  if (await voiceWarning.first().isVisible({ timeout: 5_000 }).catch(() => false)) {
+    throw new Error(
+      "Test account isn't in a voice channel. Join the dev guild's voice channel " +
+        "with the test user (manually, once) before running this suite. See README.",
+    );
+  }
+
   // The bot replies with an ephemeral message containing Accept/Decline.
   // Ephemeral messages in Discord web have an "Only you can see this"
   // footer hint we can anchor to.

@@ -53,6 +53,21 @@ test user.
    ```
    (Or set `DATA_API_URL` to whatever you tunnel on.)
 
+## Prerequisites for the test account
+
+The test asserts the consent flow on the response to `/record`. The bot
+only posts the consent embed if the invoker is **already in a voice
+channel** of the test guild. Two ways to satisfy this:
+
+- Pop a real Discord client open with the test user and join any voice
+  channel in the guild. Stay in. Run the suite.
+- (Future) auto-join via Playwright by clicking a voice channel name
+  in the sidebar — works for muted "presence join" without needing a
+  real WebRTC stream. Not implemented yet.
+
+If the test account isn't in voice when the suite runs, you'll get a
+fast, explicit failure pointing here.
+
 ## Running
 
 Human-visible (useful when debugging selector breakage):
