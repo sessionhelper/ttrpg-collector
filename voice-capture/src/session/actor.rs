@@ -957,6 +957,10 @@ async fn drive_session(
                 }
             }
             _ = heal_tick.tick() => {
+                // Post-gate inference: catch mid-recording joiners whose
+                // OP5 never landed. Low cadence (5s) is fine — stabilization
+                // is already past, nothing is racing.
+                env.obs.infer_ssrc_mappings(&env.humans_in_channel);
                 let Some(manager) = songbird::get(&env.ctx).await else { continue };
                 let verdict = crate::session::heal::check_and_heal(
                     &manager,
@@ -1026,6 +1030,15 @@ async fn wait_for_gate(
                 }
             }
             _ = poll.tick() => {
+                // SSRC-mapping inference: covers the case where Discord's
+                // OP5 SpeakingStateUpdate never fires for a user who was
+                // already speaking before our voice-WS finished handshaking.
+                // Without this, stabilization times out and the session
+                // cancels. Two rules applied: solo (1 human, any unmapped)
+                // and last-missing-pair (exactly 1 unmapped user + 1 unmapped
+                // ssrc). Both are unambiguous by set algebra; abstains
+                // otherwise.
+                env.obs.infer_ssrc_mappings(&env.humans_in_channel);
                 let verdict = stabilization::evaluate(gate_inputs);
                 match tracker.observe(verdict) {
                     StreakStatus::GateOpens { total_secs } => {
