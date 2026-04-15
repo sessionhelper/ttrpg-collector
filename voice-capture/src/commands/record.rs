@@ -62,16 +62,30 @@ async fn record_inner(
                 EditInteractionResponse::new().content("You need to be in a voice channel."),
             );
         };
+        // Known bot UIDs in this channel — our own bot + any bot whose
+        // member cache entry we actually have. Can't rely *only* on the
+        // member cache because it's sometimes not hydrated yet at /record
+        // time (observed empirically on a fresh guild).
+        let our_bot_id = ctx.cache.current_user().id;
         let members: Vec<(UserId, String)> = guild
             .voice_states
             .iter()
             .filter(|(_, vs)| vs.channel_id == Some(channel_id))
-            .filter_map(|(uid, _)| {
-                let member = guild.members.get(uid)?;
-                if member.user.bot {
-                    return None;
-                }
-                Some((*uid, member.display_name().to_string()))
+            .map(|(uid, _)| *uid)
+            .filter(|uid| *uid != our_bot_id)
+            .map(|uid| {
+                let display_name = guild
+                    .members
+                    .get(&uid)
+                    .map(|m| m.display_name().to_string())
+                    .unwrap_or_else(|| format!("user-{}", uid.get()));
+                (uid, display_name)
+            })
+            // Drop any member-cache-confirmed bot (non-self). Cache-miss
+            // defaults to treating the UID as human — safer than dropping
+            // a real user because their cache hadn't filled.
+            .filter(|(uid, _)| {
+                guild.members.get(uid).map(|m| !m.user.bot).unwrap_or(true)
             })
             .collect();
         (channel_id, members)
