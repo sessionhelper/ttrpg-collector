@@ -1,19 +1,24 @@
-name: Deploy
+name: Build & Deploy
+
+# Image tag semantics:
+#   :sha-<short>        — every push
+#   :branch-<sanitized> — pushes to main or refactor/** (for targeted dev smoke)
+#   :dev, :latest, :v*  — only on version-tag pushes (the "canonical release")
+#
+# Prod SSH deploy runs ONLY on version tags. Branch pushes never touch prod.
 
 on:
   push:
+    branches: [main, 'refactor/**']
     tags: ['v*']
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-  build-and-deploy:
+  build-and-push:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -23,31 +28,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}"
+          SHORT="${GITHUB_SHA::7}"
+          TAGS="$IMAGE:sha-$SHORT"
+          if [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            SANITIZED="$(echo "$BRANCH" | tr '/' '-')"
+            TAGS="$TAGS,$IMAGE:branch-$SANITIZED"
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            TAGS="$TAGS,$IMAGE:dev,$IMAGE:latest,$IMAGE:$VERSION"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@v6
         with:
           push: true
           context: .
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:dev
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
 
-      # Deploy to the Chronicle prod compose stack on the production VPS.
-      # The stack lives at /opt/ovp/ and is supervised by systemd via
-      # chronicle-data-api.service (which despite the name brings up the
-      # whole compose stack: postgres, data-api, collector).
-      #
-      # Canonical compose file lives in sessionhelper-hub/infra/prod-compose.yml.
-      # Fetched fresh on every deploy to avoid drift between the hub source
-      # of truth and the running VPS state.
-      #
-      # Pulling the new collector image and restarting the service is enough;
-      # the systemd unit's ExecStart runs `docker compose up -d` which
-      # re-creates any containers whose images changed.
+  deploy-prod:
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
       - name: Deploy to VPS
         uses: appleboy/ssh-action@v1
         with:

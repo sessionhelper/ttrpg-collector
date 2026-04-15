@@ -1,6 +1,12 @@
 //! CLI / environment variable configuration via clap.
+//!
+//! `BYPASS_CONSENT_USER_IDS` was removed in the features-pass refactor:
+//! programmatic testing now flows through the harness HTTP surface
+//! (`POST /enrol`, `/consent`, `/license`, `/record`, `/stop`), which
+//! exercises the same `SessionCmd` actor commands as real Discord
+//! interactions. No privileged user IDs.
 
-use std::collections::HashSet;
+use std::path::PathBuf;
 
 use clap::Parser;
 
@@ -20,63 +26,59 @@ pub struct Config {
     #[arg(long, env = "DATA_API_SHARED_SECRET")]
     pub data_api_shared_secret: String,
 
-    /// Local buffer directory
-    #[arg(long, env = "LOCAL_BUFFER_DIR", default_value = "./sessions")]
-    pub local_buffer_dir: String,
+    /// Local directory for the per-session pre-consent chunk cache.
+    /// Empty string → default `<tmpdir>/chronicle-bot` (usually `/tmp/chronicle-bot`).
+    /// Each participant writes to `<dir>/<session_id>/<pseudo_id>/chunk_<seq:06>.pcm`.
+    #[arg(long, env = "LOCAL_BUFFER_DIR", default_value = "")]
+    pub local_buffer_dir_raw: String,
 
-    /// Minimum participants to start recording. Defaults to 1 (solo dev
-    /// testing). Prod deployments that want quorum should set
-    /// MIN_PARTICIPANTS=2 (or higher) in their env file.
+    /// Maximum seconds of cached audio retained per participant before oldest-first
+    /// drop kicks in. Defaults to 7200 (2h). On overflow the oldest chunk files are
+    /// unlinked and `chronicle_prerolled_chunks_dropped_total` increments.
+    #[arg(long, env = "LOCAL_BUFFER_MAX_SECS", default_value_t = 7200)]
+    pub local_buffer_max_secs: u64,
+
+    /// Seconds of continuous "all expected SSRCs healthy + user-mapped" before
+    /// the stabilization gate opens and the "Recording started" announcement plays.
+    /// Before the gate: leave/rejoin/retry freely. After: heal silently.
+    #[arg(long, env = "STABILIZATION_GATE_SECS", default_value_t = 3)]
+    pub stabilization_gate_secs: u64,
+
+    /// Minimum participants to start recording. Defaults to 1 (solo dev testing).
     #[arg(long, env = "MIN_PARTICIPANTS", default_value = "1")]
     pub min_participants: usize,
 
-    /// Require all participants to consent
+    /// Require all participants to consent.
     #[arg(long, env = "REQUIRE_ALL_CONSENT", default_value = "true")]
     pub require_all_consent: bool,
 
-    /// Comma-separated Discord user IDs that auto-consent at session start
-    /// without clicking the consent button. **Dev/E2E harness only.** The
-    /// prod deployment leaves this empty and the collector therefore never
-    /// bypasses consent.
-    ///
-    /// This exists so the feeder-bot fleet in `chronicle-feeder` can
-    /// be recorded during E2E runs — those bots can't click Discord buttons
-    /// on their own. Setting this list to non-empty on a prod deployment
-    /// would break the consent contract with real users.
-    #[arg(long, env = "BYPASS_CONSENT_USER_IDS", default_value = "")]
-    pub bypass_consent_user_ids_raw: String,
-
-    /// If set to true, spawn the loopback E2E harness HTTP server
-    /// (`POST /record`, `POST /stop`, `GET /health`) that lets an external
-    /// test runner drive the collector without a Discord client. **Dev
-    /// only.** Prod leaves this false and the axum task is never spawned.
-    ///
-    /// Paired with `HARNESS_PORT` (default 8010) and should be bound to
-    /// `127.0.0.1` on the host via the compose port mapping —
-    /// `127.0.0.1:8010:8010` — never exposed publicly.
+    /// If set to true, spawn the loopback E2E harness HTTP server. Dev only.
+    /// Endpoints: `POST /record`, `/enrol`, `/consent`, `/license`, `/stop`,
+    /// `GET /health`, `GET /status`.
     #[arg(long, env = "HARNESS_ENABLED", default_value_t = false)]
     pub harness_enabled: bool,
 
     /// TCP port for the E2E harness HTTP server, inside the container.
-    /// Only relevant when `harness_enabled` is true.
     #[arg(long, env = "HARNESS_PORT", default_value_t = 8010)]
     pub harness_port: u16,
+
+    /// Bind address for the harness HTTP server. Defaults to loopback for
+    /// host-run safety; in Docker set HARNESS_BIND=0.0.0.0 so the compose
+    /// port mapping (`127.0.0.1:<port>:<port>`) can reach it. Host-side
+    /// safety is still enforced by the loopback-only port mapping.
+    #[arg(long, env = "HARNESS_BIND", default_value = "127.0.0.1")]
+    pub harness_bind: std::net::IpAddr,
 }
 
 impl Config {
-    /// Parse `bypass_consent_user_ids_raw` into a deduplicated set of Discord
-    /// user IDs. Empty string → empty set → bypass disabled (the prod default).
-    ///
-    /// Entries that fail to parse as `u64` are silently dropped — a malformed
-    /// env var should not crash the bot, but the ignored value is never
-    /// treated as "valid bypass id 0" either.
-    pub fn bypass_consent_user_ids(&self) -> HashSet<u64> {
-        self.bypass_consent_user_ids_raw
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse::<u64>().ok())
-            .collect()
+    /// Resolve the effective local buffer directory.
+    pub fn local_buffer_dir(&self) -> PathBuf {
+        let raw = self.local_buffer_dir_raw.trim();
+        if raw.is_empty() {
+            std::env::temp_dir().join("chronicle-bot")
+        } else {
+            PathBuf::from(raw)
+        }
     }
 }
 
@@ -84,47 +86,31 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn cfg(raw: &str) -> Config {
+    fn cfg(local_buffer_dir_raw: &str) -> Config {
         Config {
             token: "t".into(),
             data_api_url: "u".into(),
             data_api_shared_secret: "s".into(),
-            local_buffer_dir: "b".into(),
+            local_buffer_dir_raw: local_buffer_dir_raw.into(),
+            local_buffer_max_secs: 7200,
+            stabilization_gate_secs: 3,
             min_participants: 1,
             require_all_consent: true,
-            bypass_consent_user_ids_raw: raw.into(),
             harness_enabled: false,
             harness_port: 8010,
+            harness_bind: "127.0.0.1".parse().unwrap(),
         }
     }
 
     #[test]
-    fn bypass_empty_string_yields_empty_set() {
-        assert!(cfg("").bypass_consent_user_ids().is_empty());
+    fn local_buffer_dir_defaults_to_tmpdir() {
+        let c = cfg("");
+        assert_eq!(c.local_buffer_dir(), std::env::temp_dir().join("chronicle-bot"));
     }
 
     #[test]
-    fn bypass_single_id_parses() {
-        let s = cfg("1490405412917215463").bypass_consent_user_ids();
-        assert_eq!(s.len(), 1);
-        assert!(s.contains(&1490405412917215463u64));
-    }
-
-    #[test]
-    fn bypass_multiple_ids_with_whitespace() {
-        let s = cfg(" 1, 2 ,3 ").bypass_consent_user_ids();
-        assert_eq!(s, [1u64, 2, 3].into_iter().collect::<HashSet<u64>>());
-    }
-
-    #[test]
-    fn bypass_ignores_garbage_entries() {
-        let s = cfg("1,notanumber,3").bypass_consent_user_ids();
-        assert_eq!(s, [1u64, 3].into_iter().collect::<HashSet<u64>>());
-    }
-
-    #[test]
-    fn bypass_dedups_duplicates() {
-        let s = cfg("1,1,2,1").bypass_consent_user_ids();
-        assert_eq!(s.len(), 2);
+    fn local_buffer_dir_uses_explicit_value() {
+        let c = cfg("/var/run/chronicle");
+        assert_eq!(c.local_buffer_dir(), PathBuf::from("/var/run/chronicle"));
     }
 }

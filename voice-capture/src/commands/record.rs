@@ -1,97 +1,82 @@
-//! `/record` slash command handler.
+//! `/record` slash command.
+//!
+//! Per the locked spec (F2/F6), the bot does not talk to the data-api at all
+//! until the stabilization gate opens. This handler's job is narrow:
+//!
+//! 1. Validate the invoker is in a voice channel.
+//! 2. Build a `Session` with the voice-channel humans pre-enrolled as
+//!    Pending participants.
+//! 3. Spawn the per-guild actor.
+//! 4. Post the consent embed into the text channel.
+//!
+//! Blocklist checks, the `POST /internal/sessions` row insert, and the
+//! `participants/batch` insert all move into the actor's gate-open path.
+//! If the gate never opens (decline, timeout, /stop before gate), the
+//! data-api never hears about the session at all — that is intentional.
+
+use std::sync::Arc;
 
 use serenity::all::*;
-use tracing::error;
+use tracing::{error, info};
 
-use crate::session::{consent_buttons, ConsentScope, Session};
+use crate::commands::respond::{respond, InteractionReply};
+use crate::session::actor::{spawn_session, SessionCmd};
+use crate::session::Session;
 use crate::state::AppState;
 
-/// Handle the /record slash command.
-///
-/// Flow (structured to avoid the TOCTOU race between active-session check
-/// and session insert):
-///   1. Cheap in-process validation — voice channel, min participants
-///   2. Build the Session struct (no network calls)
-///   3. Atomically reserve the guild's slot via SessionManager::try_insert;
-///      if a session already exists, reply and bail
-///   4. Defer the interaction — now we have 15 minutes for the slow work
-///   5. Persist to Data API (create_session, add_participant per member)
-///   6. Edit the deferred response with the consent embed
-///   7. If step 5 or 6 fails, roll back by removing the session from the
-///      manager and best-effort marking the Data API row abandoned
-#[tracing::instrument(skip(ctx, command, state), fields(guild_id = %command.guild_id.unwrap()))]
+#[tracing::instrument(skip(ctx, command, state), fields(guild_id = %command.guild_id.map(|g| g.get()).unwrap_or(0)))]
 pub async fn handle_record(
     ctx: &Context,
     command: &CommandInteraction,
-    state: &AppState,
+    state: &Arc<AppState>,
 ) -> Result<(), serenity::Error> {
-    let guild_id = command.guild_id.unwrap();
+    respond(ctx, command, || record_inner(ctx, command, state)).await
+}
 
-    // Find the user's voice channel (cache lookup, instant)
-    let guild = ctx.cache.guild(guild_id).unwrap().clone();
-    let channel_id = guild
-        .voice_states
-        .get(&command.user.id)
-        .and_then(|vs| vs.channel_id);
-
-    let channel_id = match channel_id {
-        Some(id) => id,
-        None => {
-            command
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("You need to be in a voice channel.")
-                            .ephemeral(true),
-                    ),
-                )
-                .await?;
-            return Ok(());
-        }
+async fn record_inner(
+    ctx: &Context,
+    command: &CommandInteraction,
+    state: &Arc<AppState>,
+) -> InteractionReply {
+    let Some(guild_id) = command.guild_id else {
+        return InteractionReply::Edit(
+            EditInteractionResponse::new().content("Run this in a server."),
+        );
     };
 
-    // Gather recordable members in the voice channel (cache, instant).
-    //
-    // Bot accounts are filtered out by default — we don't want to record
-    // music bots, utility bots, or other non-human actors that happen to
-    // share the channel. The sole exception is the E2E harness bypass list:
-    // Discord user IDs in `BYPASS_CONSENT_USER_IDS` are treated as
-    // recordable even though they're flagged `user.bot = true`, so the
-    // feeder fleet (Moe/Larry/Curly/Gygax) in `chronicle-feeder` can
-    // participate in test sessions. Prod leaves the bypass list empty.
-    let bypass_ids = state.config.bypass_consent_user_ids();
-    let members: Vec<(UserId, String)> = guild
-        .voice_states
-        .iter()
-        .filter(|(_, vs)| vs.channel_id == Some(channel_id))
-        .filter_map(|(uid, _)| {
-            let member = guild.members.get(uid)?;
-            if member.user.bot && !bypass_ids.contains(&uid.get()) {
-                return None;
-            }
-            Some((*uid, member.display_name().to_string()))
-        })
-        .collect();
+    // Extract voice-channel members INSIDE a block so the `CacheRef` drops
+    // before we `.await` — the dashmap guard it carries is `!Send`.
+    let (channel_id, members) = {
+        let Some(guild_arc) = ctx.cache.guild(guild_id) else {
+            return InteractionReply::Edit(
+                EditInteractionResponse::new().content("Guild cache not populated yet."),
+            );
+        };
+        let guild = guild_arc;
+        let Some(channel_id) = guild
+            .voice_states
+            .get(&command.user.id)
+            .and_then(|vs| vs.channel_id)
+        else {
+            return InteractionReply::Edit(
+                EditInteractionResponse::new().content("You need to be in a voice channel."),
+            );
+        };
+        let members: Vec<(UserId, String)> = guild
+            .voice_states
+            .iter()
+            .filter(|(_, vs)| vs.channel_id == Some(channel_id))
+            .filter_map(|(uid, _)| {
+                let member = guild.members.get(uid)?;
+                if member.user.bot {
+                    return None;
+                }
+                Some((*uid, member.display_name().to_string()))
+            })
+            .collect();
+        (channel_id, members)
+    };
 
-    if members.len() < state.config.min_participants {
-        command
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content(format!(
-                            "Need at least {} people in the voice channel.",
-                            state.config.min_participants
-                        ))
-                        .ephemeral(true),
-                ),
-            )
-            .await?;
-        return Ok(());
-    }
-
-    // Build the session locally (no network calls in the constructor)
     let mut session = Session::new(
         guild_id.get(),
         channel_id.get(),
@@ -105,250 +90,62 @@ pub async fn handle_record(
     }
     let session_id = session.id.clone();
 
-    // Atomically reserve the guild's slot. If another /record is in flight
-    // for this guild, bail instantly — no Data API rows created, no Discord
-    // side-effects, no lock held across await points.
-    {
-        let mut sessions = state.sessions.lock().await;
-        if let Err(_rejected) = sessions.try_insert(session) {
-            drop(sessions);
-            command
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("A recording session is already active in this server.")
-                            .ephemeral(true),
-                    ),
-                )
-                .await?;
-            return Ok(());
-        }
-    }
-
-    // Slot reserved. Defer the Discord interaction so the slow work below
-    // can run without fighting the 3-second response window.
-    command
-        .create_response(
-            &ctx.http,
-            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
-        )
-        .await?;
-
-    // Persist session and participants to Data API. Track the first hard
-    // failure so we can roll back cleanly — individual add_participant
-    // failures are logged but not treated as fatal.
-    let session_uuid = uuid::Uuid::parse_str(&session_id).ok();
-    let mut create_failed = false;
-    if let Some(sid) = session_uuid {
-        let s3_prefix = format!("sessions/{}/{}", guild_id.get(), session_id);
-        if let Err(e) = state
-            .api
-            .create_session(
-                sid,
-                guild_id.get() as i64,
-                chrono::Utc::now(),
-                None,
-                None,
-                Some(s3_prefix),
-            )
-            .await
-        {
-            error!("API call failed (create_session): {e}");
-            create_failed = true;
-        }
-
-        if !create_failed {
-            // Blocklist check per user first. Users who've opted out
-            // globally are dropped from the batch before it's sent.
-            let mut accepted: Vec<(UserId, u64, String)> = Vec::with_capacity(members.len());
-            for (uid, name) in &members {
-                match state.api.check_blocklist(uid.get()).await {
-                    Ok(true) => {
-                        tracing::info!(
-                            user_id = %uid,
-                            "participant_blocked — user opted out globally, skipping"
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("API call failed (check_blocklist): {e}");
-                    }
-                    _ => {}
-                }
-                accepted.push((*uid, uid.get(), name.clone()));
-            }
-
-            // Single batch insert + single response → one HTTP round trip
-            // regardless of party size. Cache each returned UUID on the
-            // local Session so consent/license clicks hit the fast path.
-            let batch_input: Vec<(u64, bool, Option<String>)> = accepted
-                .iter()
-                .map(|(_, raw, name)| (*raw, false, Some(name.clone())))
-                .collect();
-            match state.api.add_participants_batch(sid, &batch_input).await {
-                Ok(rows) => {
-                    let count = rows.len();
-                    let mut sessions = state.sessions.lock().await;
-                    if let Some(s) = sessions.get_mut(guild_id.get()) {
-                        for ((user_id, _, _), row) in accepted.iter().zip(rows.iter()) {
-                            s.set_participant_uuid(*user_id, row.id);
-                        }
-                    }
-                    tracing::info!(
-                        participants = count,
-                        "participants_batched_and_cached",
-                    );
-                }
-                Err(e) => {
-                    error!("API call failed (add_participants_batch): {e}");
-                }
-            }
-
-            // --- E2E harness bypass ----------------------------------------
-            //
-            // If BYPASS_CONSENT_USER_IDS is non-empty, any listed Discord
-            // user in this session is marked as consented (ConsentScope::Full)
-            // locally and remotely WITHOUT a button click. Dev/harness only;
-            // the prod env file leaves this empty so the normal consent flow
-            // is untouched.
-            //
-            // The human user still needs to click Accept for themselves —
-            // this path is only for bot/harness participants that can't click
-            // buttons. When the human consents, the existing quorum check
-            // sees the bypass users as already-accepted and includes them in
-            // the recording just like manually-consented participants.
-            //
-            // Mid-session joiner bypass is NOT handled here (add_participant
-            // fires from voice/events.rs for joiners). Not needed for the
-            // current harness design where all feeders join the channel
-            // before /record fires. See voice/events.rs TODO if that changes.
-            let bypass = state.config.bypass_consent_user_ids();
-            if !bypass.is_empty() {
-                // Snapshot (user_id, participant_uuid) for bypass-eligible
-                // users before we release the lock for the remote calls.
-                let to_bypass: Vec<(UserId, uuid::Uuid)> = {
-                    let sessions = state.sessions.lock().await;
-                    match sessions.get(guild_id.get()) {
-                        Some(s) => accepted
-                            .iter()
-                            .filter(|(_, raw, _)| bypass.contains(raw))
-                            .filter_map(|(uid, _, _)| s.participant_uuid(*uid).map(|pid| (*uid, pid)))
-                            .collect(),
-                        None => Vec::new(),
-                    }
-                };
-
-                if !to_bypass.is_empty() {
-                    // Local state transition first — cheap, held briefly.
-                    {
-                        let mut sessions = state.sessions.lock().await;
-                        if let Some(s) = sessions.get_mut(guild_id.get()) {
-                            for (uid, _) in &to_bypass {
-                                s.record_consent(*uid, ConsentScope::Full);
-                            }
-                        }
-                    }
-
-                    // Remote state — each PATCH is independent; any single
-                    // failure is logged but non-fatal so one flaky participant
-                    // doesn't block the rest of the session.
-                    for (uid, pid) in &to_bypass {
-                        if let Err(e) = state.api.record_consent_by_id(*pid, "full").await {
-                            error!(
-                                user_id = %uid,
-                                participant_id = %pid,
-                                error = %e,
-                                "API call failed (record_consent_by_id bypass)",
-                            );
-                        }
-                    }
-
-                    tracing::info!(
-                        bypassed = to_bypass.len(),
-                        "bypass_consent_applied",
-                    );
-                }
-            }
-        }
-    }
-
-    // If the Data API session row couldn't be created, roll back the local
-    // reservation so a retry isn't blocked by a zombie entry.
-    if create_failed {
-        let mut sessions = state.sessions.lock().await;
-        sessions.remove(guild_id.get());
-        drop(sessions);
-        let _ = command
-            .edit_response(
-                &ctx.http,
+    let handle = match spawn_session(state.clone(), ctx.clone(), session) {
+        Ok(h) => h,
+        Err(_) => {
+            return InteractionReply::Edit(
                 EditInteractionResponse::new()
-                    .content("Couldn't reach the storage backend. Try `/record` again in a moment."),
-            )
-            .await;
-        return Ok(());
-    }
-
-    // Build the consent embed now that the reserved session has participants.
-    // Re-borrow the reserved session to read the embed state.
-    let (embed, buttons) = {
-        let sessions = state.sessions.lock().await;
-        match sessions.get(guild_id.get()) {
-            Some(s) => (s.consent_embed(), consent_buttons()),
-            None => {
-                // The session was removed between reservation and here —
-                // e.g. by /stop or auto_stop. Nothing more to do.
-                let _ = command
-                    .edit_response(
-                        &ctx.http,
-                        EditInteractionResponse::new()
-                            .content("Session was cancelled. Try `/record` again."),
-                    )
-                    .await;
-                return Ok(());
-            }
+                    .content("A recording session is already active in this server."),
+            );
         }
     };
 
+    // Render the first consent embed. The actor has its own copy of the
+    // Session; we build a display-only one here so we don't reach into the
+    // actor's state from the handler.
+    let mut display_session = Session::new(
+        guild_id.get(),
+        channel_id.get(),
+        command.channel_id.get(),
+        command.user.id,
+        state.config.min_participants,
+        state.config.require_all_consent,
+    );
+    for (uid, name) in &members {
+        display_session.add_participant(*uid, name.clone(), false);
+    }
+    let embed = display_session.consent_embed();
     let mentions: String = members
         .iter()
         .map(|(uid, _)| format!("<@{}>", uid))
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Fill in the deferred response with the consent embed. On failure,
-    // roll back the reservation and (best-effort) mark the Data API session
-    // abandoned so we don't leak a row.
     match command
         .edit_response(
             &ctx.http,
             EditInteractionResponse::new()
                 .content(mentions)
                 .embed(embed)
-                .components(vec![buttons]),
+                .components(vec![crate::session::consent_buttons()]),
         )
         .await
     {
         Ok(msg) => {
             metrics::counter!("chronicle_sessions_total", "outcome" => "started").increment(1);
-            let mut sessions = state.sessions.lock().await;
-            if let Some(s) = sessions.get_mut(guild_id.get()) {
-                s.consent_message = Some((msg.channel_id, msg.id));
-            }
+            let _ = handle
+                .send(SessionCmd::SetConsentMessage {
+                    channel_id: msg.channel_id,
+                    message_id: msg.id,
+                })
+                .await;
+            info!(session_id = %session_id, "session_spawned");
         }
         Err(e) => {
-            error!(error = %e, "edit_response_failed — rolling back reservation");
-            let mut sessions = state.sessions.lock().await;
-            sessions.remove(guild_id.get());
-            drop(sessions);
-            if let Some(sid) = session_uuid
-                && let Err(api_e) = state.api.abandon_session(sid).await
-            {
-                error!("API call failed (abandon_session): {api_e}");
-            }
-            return Err(e);
+            error!(error = %e, "edit_response_failed — tearing down");
+            let _ = handle.send(SessionCmd::AutoStop).await;
         }
     }
 
-    Ok(())
+    InteractionReply::Silent
 }

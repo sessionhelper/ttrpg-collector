@@ -36,10 +36,11 @@ pub struct SessionResponse {
 pub struct ParticipantResponse {
     pub id: Uuid,
     pub session_id: Uuid,
-    pub user_id: Option<Uuid>,
+    pub pseudo_id: String,
     pub consent_scope: Option<String>,
     pub consented_at: Option<DateTime<Utc>>,
-    pub withdrawn_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub data_wiped_at: Option<DateTime<Utc>>,
     pub mid_session_join: bool,
     pub no_llm_training: bool,
     pub no_public_release: bool,
@@ -48,10 +49,11 @@ pub struct ParticipantResponse {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct UserResponse {
-    pub id: Uuid,
-    pub discord_id_hash: String,
     pub pseudo_id: String,
-    pub global_opt_out: bool,
+    #[serde(default)]
+    pub is_admin: bool,
+    #[serde(default)]
+    pub data_wiped_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,18 +88,20 @@ struct UpdateSessionRequest {
 
 #[derive(Serialize)]
 struct CreateUserRequest {
-    discord_id_hash: String,
     pseudo_id: String,
 }
 
 #[derive(Serialize)]
+struct DisplayNameRequest {
+    display_name: String,
+    source: &'static str,
+}
+
+#[derive(Serialize)]
 struct AddParticipantRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_id: Option<Uuid>,
+    pseudo_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     mid_session_join: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -171,6 +175,21 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ApiE
 }
 
 impl DataApiClient {
+    /// Build a stub client for tests that never actually talk to the API.
+    /// Calls will fail with connection errors — callers must ensure their
+    /// test path doesn't reach the network. Dev-only; hidden behind
+    /// `#[cfg(test)]` so it can't ship.
+    #[cfg(test)]
+    pub fn test_stub() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:0".to_string(),
+            session_token: tokio::sync::RwLock::new(String::new()),
+            shared_secret: String::new(),
+            service_name: "test".to_string(),
+        }
+    }
+
     /// Authenticate with the Data API using a shared secret.
     /// Returns a client ready to make authenticated requests.
     pub async fn authenticate(
@@ -272,6 +291,7 @@ impl DataApiClient {
     }
 
     /// Update session status (replaces db::update_session_state).
+    #[allow(dead_code)]
     pub async fn update_session_state(
         &self,
         session_id: Uuid,
@@ -355,13 +375,35 @@ impl DataApiClient {
             .client
             .post(format!("{}/internal/users", self.base_url))
             .header("authorization", self.auth_header().await)
-            .json(&CreateUserRequest {
-                discord_id_hash: pseudo_id.clone(),
-                pseudo_id,
-            })
+            .json(&CreateUserRequest { pseudo_id })
             .send()
             .await?;
         Ok(check_status(resp).await?.json().await?)
+    }
+
+    /// Record a display name for a pseudo_id. Fire-and-forget error
+    /// handling — display names are an affordance, not a correctness
+    /// requirement, so a failure here doesn't block enrolment.
+    async fn record_display_name(
+        &self,
+        pseudo_id: &str,
+        display_name: &str,
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .client
+            .post(format!(
+                "{}/internal/users/{}/display_names",
+                self.base_url, pseudo_id
+            ))
+            .header("authorization", self.auth_header().await)
+            .json(&DisplayNameRequest {
+                display_name: display_name.to_string(),
+                source: "bot",
+            })
+            .send()
+            .await?;
+        check_status(resp).await?;
+        Ok(())
     }
 
     /// Look up a participant row by (session_id, discord_user_id). This is
@@ -381,18 +423,19 @@ impl DataApiClient {
         let participants = self.list_participants(session_id).await?;
         participants
             .into_iter()
-            .find(|p| p.user_id == Some(user.id))
+            .find(|p| p.pseudo_id == user.pseudo_id)
             .ok_or_else(|| ApiError::Status {
                 status: 404,
                 body: "participant not found for user".to_string(),
             })
     }
 
-    /// Upsert a user and check if they're on the blocklist (replaces db::check_blocklist).
-    /// Returns true if the user has opted out globally.
+    /// Upsert a user and check if their data has been wiped (post-refactor
+    /// replacement for the old `global_opt_out` flag). `data_wiped_at`
+    /// being set means the user invoked self-deletion; treat as blocked.
     pub async fn check_blocklist(&self, discord_user_id: u64) -> Result<bool, ApiError> {
         let user = self.upsert_user(discord_user_id).await?;
-        Ok(user.global_opt_out)
+        Ok(user.data_wiped_at.is_some())
     }
 
     // --- Participants ---
@@ -406,6 +449,9 @@ impl DataApiClient {
         display_name: Option<String>,
     ) -> Result<ParticipantResponse, ApiError> {
         let user = self.upsert_user(discord_user_id).await?;
+        if let Some(name) = display_name.as_deref() {
+            let _ = self.record_display_name(&user.pseudo_id, name).await;
+        }
         let resp = self
             .client
             .post(format!(
@@ -414,9 +460,8 @@ impl DataApiClient {
             ))
             .header("authorization", self.auth_header().await)
             .json(&AddParticipantRequest {
-                user_id: Some(user.id),
+                pseudo_id: user.pseudo_id,
                 mid_session_join: Some(mid_session_join),
-                display_name,
             })
             .send()
             .await?;
@@ -439,10 +484,12 @@ impl DataApiClient {
         let mut requests = Vec::with_capacity(participants.len());
         for (discord_user_id, mid_session_join, display_name) in participants {
             let user = self.upsert_user(*discord_user_id).await?;
+            if let Some(name) = display_name.as_deref() {
+                let _ = self.record_display_name(&user.pseudo_id, name).await;
+            }
             requests.push(AddParticipantRequest {
-                user_id: Some(user.id),
+                pseudo_id: user.pseudo_id,
                 mid_session_join: Some(*mid_session_join),
-                display_name: display_name.clone(),
             });
         }
         let resp = self
@@ -501,6 +548,7 @@ impl DataApiClient {
     /// Toggle a license flag (no_llm_training or no_public_release).
     /// Fallback path. Returns the new (no_llm_training, no_public_release)
     /// tuple for the caller to display in the refreshed button row.
+    #[allow(dead_code)]
     pub async fn toggle_license_flag(
         &self,
         session_id: Uuid,
@@ -522,6 +570,7 @@ impl DataApiClient {
     /// values (e.g. from the previous PATCH response or the initial
     /// add_participants_batch response). Returns the new
     /// (no_llm_training, no_public_release) tuple.
+    #[allow(dead_code)]
     pub async fn toggle_license_flag_by_id(
         &self,
         participant_id: Uuid,
@@ -534,6 +583,21 @@ impl DataApiClient {
             "no_public_release" => (None, Some(!current_no_public)),
             _ => return Ok((current_no_llm, current_no_public)),
         };
+        self.set_license_flags_by_id(participant_id, no_llm, no_public)
+            .await
+    }
+
+    /// Set license flags directly — absolute (not toggle) semantics. `None`
+    /// leaves the field unchanged on the server. Used by:
+    ///   - F4 default-flag writes on Accept (both `Some(false)`).
+    ///   - Harness `POST /license` (one field explicitly set).
+    ///   - Future portal license UI.
+    pub async fn set_license_flags_by_id(
+        &self,
+        participant_id: Uuid,
+        no_llm_training: Option<bool>,
+        no_public_release: Option<bool>,
+    ) -> Result<(bool, bool), ApiError> {
         let resp = self
             .client
             .patch(format!(
@@ -542,8 +606,8 @@ impl DataApiClient {
             ))
             .header("authorization", self.auth_header().await)
             .json(&UpdateLicenseRequest {
-                no_llm_training: no_llm,
-                no_public_release: no_public,
+                no_llm_training,
+                no_public_release,
             })
             .send()
             .await?;
@@ -570,57 +634,30 @@ impl DataApiClient {
 
     // --- Audio ---
 
-    /// Upload a PCM audio chunk (replaces s3.upload_bytes for audio).
-    /// Sends raw bytes as the request body. Single-attempt — prefer
-    /// [`upload_chunk_with_retry`] for live-recording code paths where
-    /// a transient data-api blip must not drop audio (R7). Kept on the
-    /// public surface as the underlying primitive; currently unused by
-    /// production code, but useful for tests and for ad-hoc callers
-    /// that need single-attempt semantics.
-    #[allow(dead_code)]
-    pub async fn upload_chunk(
-        &self,
-        session_id: Uuid,
-        pseudo_id: &str,
-        data: Vec<u8>,
-    ) -> Result<(), ApiError> {
-        let size = data.len();
-        let resp = self
-            .client
-            .post(format!(
-                "{}/internal/sessions/{}/audio/{}/chunk",
-                self.base_url, session_id, pseudo_id
-            ))
-            .header("authorization", self.auth_header().await)
-            .header("content-type", "application/octet-stream")
-            .body(data)
-            .send()
-            .await?;
-        check_status(resp).await?;
-        info!(session_id = %session_id, pseudo_id = %pseudo_id, size = size, "chunk_uploaded");
-        Ok(())
-    }
-
     /// Upload a PCM audio chunk with retry on transient errors (R7).
     ///
-    /// Retry policy, mirroring `chronicle-worker::api_client::download_chunk_with_retry`:
-    /// - **5xx** (server error) or network error: retry up to 3 times with
-    ///   1s / 2s / 4s backoff.
-    /// - **401** (unauthorized): re-authenticate once, then retry. The
-    ///   collector's token is reaped by the Data API after 90s of
-    ///   heartbeat silence, so this path fires on the first upload after
-    ///   a heartbeat interruption.
-    /// - **4xx** (other client errors): fail immediately — retrying a
-    ///   400/413/etc. will not resolve the underlying problem.
+    /// Per-chunk headers (required by the locked data-api spec):
+    /// - `X-Capture-Started-At` — UTC timestamp of the first sample in this
+    ///   chunk, ISO-8601. For pre-gate flushed chunks this is the original
+    ///   capture time (possibly minutes before gate-open); for post-gate
+    ///   live chunks it is "now when the accumulator rolled over." The
+    ///   data-api uses this to reconstruct the stream as if it had been
+    ///   arriving live even for chunks that were cached pre-gate.
+    /// - `X-Duration-Ms` — PCM-derived wall-clock duration of this chunk.
+    /// - `X-Client-Chunk-Id` — idempotency key, `{session}:{pseudo}:{seq}`.
     ///
-    /// On success returns `Ok(())`. On final failure (all 3 attempts
-    /// exhausted, or a non-retryable 4xx) returns the last error seen
-    /// so the caller can log it and mark the chunk as lost.
+    /// Retry policy, mirroring `chronicle-worker::api_client::download_chunk_with_retry`:
+    /// - **5xx** or network error: retry up to 3 times with 1s/2s/4s backoff.
+    /// - **401**: re-authenticate once, retry.
+    /// - **4xx**: fail immediately.
     pub async fn upload_chunk_with_retry(
         &self,
         session_id: Uuid,
         pseudo_id: &str,
         data: Vec<u8>,
+        capture_started_at: DateTime<Utc>,
+        duration_ms: u64,
+        client_chunk_id: &str,
     ) -> Result<(), ApiError> {
         const MAX_RETRIES: u32 = 3;
         let backoff_durations = [
@@ -633,11 +670,8 @@ impl DataApiClient {
             "{}/internal/sessions/{}/audio/{}/chunk",
             self.base_url, session_id, pseudo_id
         );
+        let captured_hdr = capture_started_at.to_rfc3339();
 
-        // Track whether we've already burned our one 401 re-auth retry.
-        // Two 401s in a row means re-auth silently failed to fix the
-        // token (e.g. shared_secret rotated out from under us) — bail
-        // instead of spinning forever.
         let mut reauth_attempted = false;
         let mut attempt: u32 = 0;
 
@@ -648,6 +682,9 @@ impl DataApiClient {
                 .post(&url)
                 .header("authorization", self.auth_header().await)
                 .header("content-type", "application/octet-stream")
+                .header("x-capture-started-at", &captured_hdr)
+                .header("x-duration-ms", duration_ms.to_string())
+                .header("x-client-chunk-id", client_chunk_id)
                 .body(data.clone())
                 .send()
                 .await;
@@ -757,6 +794,20 @@ impl DataApiClient {
 
     // --- Metadata ---
 
+    /// Construct an instance pointing at the supplied base URL with no auth
+    /// flow. Used only by integration tests that host their own local
+    /// test server; never shipped.
+    #[cfg(test)]
+    pub fn for_test_base_url(base_url: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into(),
+            session_token: tokio::sync::RwLock::new("test-token".to_string()),
+            shared_secret: String::new(),
+            service_name: "test".to_string(),
+        }
+    }
+
     /// Upload session metadata (meta.json + consent.json) to the Data API.
     pub async fn write_metadata(
         &self,
@@ -784,5 +835,99 @@ impl DataApiClient {
             .await?;
         check_status(resp).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use chrono::TimeZone;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as TokioMutex;
+
+    #[derive(Default)]
+    struct Captured {
+        capture_started_at: Option<String>,
+        duration_ms: Option<String>,
+        client_chunk_id: Option<String>,
+        body_len: usize,
+    }
+
+    async fn chunk_sink(
+        State(state): State<Arc<TokioMutex<Captured>>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, Body) {
+        let mut c = state.lock().await;
+        c.capture_started_at = headers
+            .get("x-capture-started-at")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        c.duration_ms = headers
+            .get("x-duration-ms")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        c.client_chunk_id = headers
+            .get("x-client-chunk-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        c.body_len = body.len();
+        (
+            StatusCode::OK,
+            Body::from(r#"{"key":"k","seq":0}"#.to_string()),
+        )
+    }
+
+    async fn run_test_server(
+        captured: Arc<TokioMutex<Captured>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let router = Router::new()
+            .route(
+                "/internal/sessions/:sid/audio/:pseudo/chunk",
+                post(chunk_sink),
+            )
+            .with_state(captured);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn upload_chunk_carries_capture_started_at_header() {
+        let captured = Arc::new(TokioMutex::new(Captured::default()));
+        let (base, _srv) = run_test_server(captured.clone()).await;
+
+        let client = DataApiClient::for_test_base_url(base);
+        let sid = uuid::Uuid::new_v4();
+        let capture_ts = chrono::Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .unwrap();
+        client
+            .upload_chunk_with_retry(
+                sid,
+                "pseudo-1",
+                vec![1u8, 2, 3, 4],
+                capture_ts,
+                42,
+                "client-chunk-id-xyz",
+            )
+            .await
+            .unwrap();
+
+        let c = captured.lock().await;
+        assert_eq!(c.capture_started_at.as_deref(), Some(capture_ts.to_rfc3339().as_str()));
+        assert_eq!(c.duration_ms.as_deref(), Some("42"));
+        assert_eq!(c.client_chunk_id.as_deref(), Some("client-chunk-id-xyz"));
+        assert_eq!(c.body_len, 4);
     }
 }

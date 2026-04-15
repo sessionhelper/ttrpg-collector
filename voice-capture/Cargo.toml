@@ -21,6 +21,7 @@ symphonia = { version = "0.5", features = ["wav", "pcm", "ogg", "vorbis"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Config + CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -54,12 +55,16 @@ rustls = { version = "0.23", features = ["ring"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytemuck = "1"
+dashmap = "6"
 
 
 [features]
 prometheus = ["dep:metrics-exporter-prometheus"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 serde_json = "1"
 walkdir = "2"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tower = { version = "0.5", features = ["util"] }

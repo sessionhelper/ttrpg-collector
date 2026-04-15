@@ -14,12 +14,13 @@ use sha2::{Digest, Sha256};
 use crate::session::ConsentScope;
 
 /// Derive a pseudonymous identifier from a Discord user ID.
-/// Uses SHA-256 truncated to 16 hex chars (8 bytes) for privacy.
+/// Per `ids.rs` / spec: `hex(sha256(discord_id))[0..24]` — 24 hex chars
+/// (12 bytes, 96 bits of entropy). Data-api rejects any other length.
 pub fn pseudonymize(user_id: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(user_id.to_string().as_bytes());
     let result = hasher.finalize();
-    hex::encode(&result[..8]) // 16 hex chars
+    hex::encode(&result[..12]) // 24 hex chars
 }
 
 /// Top-level session metadata written to `meta.json` in S3.
@@ -93,16 +94,16 @@ mod tests {
     }
 
     #[test]
-    fn pseudonymize_is_16_hex_chars() {
+    fn pseudonymize_is_24_hex_chars() {
         let p = pseudonymize(999);
-        assert_eq!(p.len(), 16);
+        assert_eq!(p.len(), 24);
         assert!(p.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn pseudonymize_matches_sha256_first_8_bytes() {
-        // Known vector: SHA-256 of a synthetic ID, first 8 bytes hex.
+    fn pseudonymize_matches_sha256_first_12_bytes() {
+        // Known vector: SHA-256 of a synthetic ID, first 12 bytes hex.
         let p = pseudonymize(123456789012345678);
-        assert_eq!(p, "37f96542b663971b");
+        assert_eq!(p, "37f96542b663971bfdf6b778");
     }
 }
