@@ -652,14 +652,27 @@ struct ActorEnv {
     expected_user_ids: Arc<StdMutex<HashSet<u64>>>,
     audio_handle: Option<AudioHandle>,
     pending_flush: JoinSet<Result<(), FlushError>>,
-    /// Set post-gate only. `None` pre-gate means there is no data-api row.
-    session_uuid: Option<uuid::Uuid>,
-    mixer: Option<MixerChannel>,
+    /// Set at gate-open, dropped at finalize. `None` outside the Recording
+    /// phase. Readers in post-gate-only code paths can `.as_ref().unwrap()`;
+    /// readers that straddle the boundary use `.as_ref().map(|r| r.field)`.
+    recording: Option<RecordingState>,
     /// Humans currently in the voice channel (excluding the bot). Drives
     /// auto-stop (F7).
     humans_in_channel: HashSet<UserId>,
     /// Outstanding auto-stop grace timer; cancel on rejoin, fire on expiry.
+    /// Lives on ActorEnv (not RecordingState) because the channel-empty
+    /// watchdog runs pre-gate too — if everyone leaves during stabilization
+    /// we still want to auto-abandon.
     empty_channel_timer: Option<JoinHandle<()>>,
+}
+
+/// Fields that only exist once the stabilization gate has opened.
+/// `session_uuid` is the data-api row created at gate-open; `mixer` is
+/// the mix-producer task started at the same moment. Both are `None`
+/// pre-gate and `Some` through finalize.
+struct RecordingState {
+    session_uuid: uuid::Uuid,
+    mixer: MixerChannel,
 }
 
 /// Auto-stop grace after the channel empties (F7).
@@ -726,8 +739,7 @@ async fn run_actor(
         expected_user_ids: expected,
         audio_handle: None,
         pending_flush: JoinSet::new(),
-        session_uuid: None,
-        mixer: None,
+        recording: None,
         humans_in_channel,
         empty_channel_timer: None,
     };
@@ -1267,8 +1279,7 @@ async fn open_the_gate(env: &mut ActorEnv, session: &mut Session) -> Result<(), 
             .await;
     }
 
-    env.session_uuid = Some(session_uuid);
-    env.mixer = Some(mixer);
+    env.recording = Some(RecordingState { session_uuid, mixer });
     Ok(())
 }
 
@@ -1432,7 +1443,7 @@ async fn apply_consent(
     }
     session.record_consent(user, scope);
 
-    let session_uuid = env.session_uuid;
+    let session_uuid = env.recording.as_ref().map(|r| r.session_uuid);
     let cached_pid = session.participant_uuid(user);
     let post_gate = session.phase.is_recording();
 
@@ -1477,14 +1488,14 @@ async fn apply_consent(
         // feeding the mix.
         if post_gate
             && scope == ConsentScope::Full
-            && let Some(mixer) = env.mixer.as_ref()
+            && let Some(r) = env.recording.as_ref()
         {
             let _ = ch
                 .tx
                 .send(ParticipantCmd::GateOpened {
                     accepted: true,
-                    session_uuid: session_uuid.expect("post_gate implies session_uuid"),
-                    mix_tx: Some(mixer.tx.clone()),
+                    session_uuid: r.session_uuid,
+                    mix_tx: Some(r.mixer.tx.clone()),
                 })
                 .await;
         }
@@ -1562,7 +1573,7 @@ async fn apply_enrol(
     session.add_participant(user_id, display_name.clone(), false);
 
     // Pre-gate: local-only enrolment. No data-api call.
-    let session_uuid_opt = env.session_uuid;
+    let session_uuid_opt = env.recording.as_ref().map(|r| r.session_uuid);
     let post_gate = session_uuid_opt.is_some();
 
     let participant_uuid = if post_gate {
@@ -1662,7 +1673,7 @@ fn recompute_humans_and_auto_stop_timer(env: &mut ActorEnv, session: &Session) {
 
 async fn finalize_normal(env: &mut ActorEnv, session: &mut Session) {
     let was_recording = session.phase.is_recording();
-    let had_gate_open = env.session_uuid.is_some();
+    let recording = env.recording.take();
     session.phase = Phase::Finalizing;
     session.ended_at = Some(Utc::now());
 
@@ -1675,10 +1686,13 @@ async fn finalize_normal(env: &mut ActorEnv, session: &mut Session) {
     }
 
     // Shut down the mix task + drain.
-    if let Some(mixer) = env.mixer.take() {
-        let _ = mixer.tx.send(MixerCmd::Shutdown).await;
-        let _ = mixer.join.await;
-    }
+    let session_uuid = if let Some(r) = recording {
+        let _ = r.mixer.tx.send(MixerCmd::Shutdown).await;
+        let _ = r.mixer.join.await;
+        Some(r.session_uuid)
+    } else {
+        None
+    };
 
     // Shut down per-participant tasks concurrently.
     let mut drains = JoinSet::new();
@@ -1690,29 +1704,27 @@ async fn finalize_normal(env: &mut ActorEnv, session: &mut Session) {
     }
     while drains.join_next().await.is_some() {}
 
-    if had_gate_open {
-        if let Some(sid) = env.session_uuid {
-            let meta_bytes = session.meta_json();
-            let consent_bytes = session.consent_json();
-            let meta_val: Option<serde_json::Value> = serde_json::from_slice(&meta_bytes).ok();
-            let consent_val: Option<serde_json::Value> = serde_json::from_slice(&consent_bytes).ok();
-            let api = env.state.api.clone();
-            let participant_count = session.participants.len() as i32;
-            let (meta_res, final_res) = tokio::join!(
-                api.write_metadata(sid, meta_val, consent_val),
-                async {
-                    let api = env.state.api.clone();
-                    api.finalize_session(sid, Utc::now(), participant_count).await
-                }
-            );
-            if let Err(e) = meta_res {
-                error!("write_metadata failed: {e}");
+    if let Some(sid) = session_uuid {
+        let meta_bytes = session.meta_json();
+        let consent_bytes = session.consent_json();
+        let meta_val: Option<serde_json::Value> = serde_json::from_slice(&meta_bytes).ok();
+        let consent_val: Option<serde_json::Value> = serde_json::from_slice(&consent_bytes).ok();
+        let api = env.state.api.clone();
+        let participant_count = session.participants.len() as i32;
+        let (meta_res, final_res) = tokio::join!(
+            api.write_metadata(sid, meta_val, consent_val),
+            async {
+                let api = env.state.api.clone();
+                api.finalize_session(sid, Utc::now(), participant_count).await
             }
-            if let Err(e) = final_res {
-                error!("finalize_session failed: {e}");
-            }
-            metrics::gauge!("chronicle_sessions_active").decrement(1.0);
+        );
+        if let Err(e) = meta_res {
+            error!("write_metadata failed: {e}");
         }
+        if let Err(e) = final_res {
+            error!("finalize_session failed: {e}");
+        }
+        metrics::gauge!("chronicle_sessions_active").decrement(1.0);
     } else {
         // Pre-gate exit: no data-api row was ever created. Drop the buffer
         // dir and post a "session abandoned" message. Per F2 in the spec,
@@ -1731,8 +1743,8 @@ async fn finalize_before_restart(env: &mut ActorEnv, session: &Session) {
         let _ = manager.leave(GuildId::new(session.guild_id)).await;
     }
     // The data-api row was created at gate-open, so mark it abandoned here.
-    if let Some(sid) = env.session_uuid
-        && let Err(e) = env.state.api.abandon_session(sid).await
+    if let Some(r) = env.recording.as_ref()
+        && let Err(e) = env.state.api.abandon_session(r.session_uuid).await
     {
         error!("abandon_session (restart) failed: {e}");
     }
