@@ -116,6 +116,16 @@ impl AudioObservables {
         if unmapped_ssrcs.is_empty() {
             return 0;
         }
+        // Diagnostic: log the decision inputs so we can see WHY we
+        // abstained. Volume is bounded (gate poll runs at 250ms and
+        // we only get here if something's unmapped). Revert once the
+        // empty-humans_in_channel root cause is settled.
+        info!(
+            humans = humans_in_channel.len(),
+            ssrcs_seen = seen_snapshot.len(),
+            ssrcs_unmapped = unmapped_ssrcs.len(),
+            "infer_ssrc_mappings_eval"
+        );
 
         // Rule 1: solo human in channel.
         if humans_in_channel.len() == 1 {

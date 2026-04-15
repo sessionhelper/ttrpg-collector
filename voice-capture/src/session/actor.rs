@@ -716,6 +716,12 @@ async fn run_actor(
     // Seed humans_in_channel with enrolled participants — they're the ones
     // in the voice channel at /record time.
     let humans_in_channel: HashSet<UserId> = session.participants.keys().copied().collect();
+    info!(
+        session_id = %session.id,
+        participants = session.participants.len(),
+        humans = humans_in_channel.len(),
+        "actor_starting"
+    );
 
     let mut env = ActorEnv {
         state: state.clone(),

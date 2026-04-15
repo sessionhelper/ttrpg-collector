@@ -62,6 +62,12 @@ async fn record_inner(
                 EditInteractionResponse::new().content("You need to be in a voice channel."),
             );
         };
+        let voice_state_count = guild
+            .voice_states
+            .iter()
+            .filter(|(_, vs)| vs.channel_id == Some(channel_id))
+            .count();
+        let cached_member_count = guild.members.len();
         let members: Vec<(UserId, String)> = guild
             .voice_states
             .iter()
@@ -74,6 +80,13 @@ async fn record_inner(
                 Some((*uid, member.display_name().to_string()))
             })
             .collect();
+        tracing::info!(
+            channel_id = %channel_id,
+            voice_state_count,
+            cached_member_count,
+            members_built = members.len(),
+            "record_members_built"
+        );
         (channel_id, members)
     };
 
