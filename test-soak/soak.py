@@ -9,14 +9,16 @@ What it proves:
   - Bot survives a multi-hour session without leaking FDs or accum.
   - Sustained packet flow doesn't stall.
   - Final session row reaches a terminal state.
+  - No DAVE decrypt distress (heal path never fires; silent-packet rate 0).
 
-Failure signals (each tagged in the log):
+Failure signals (each tagged in the report):
   - RSS growth > RSS_GROWTH_LIMIT_MB_PER_HR
   - FD count growth > FD_GROWTH_LIMIT_PER_HR
-  - chronicle_dave_heal_requests_total increments (any)
-  - silent-packet rate > 0 in any voice_rx_rollup
+  - DAVE heal fired > 0 (dave_heal_firing log line during soak window)
+  - DAVE heal requested > DAVE_HEAL_REQUEST_LIMIT (receiver-side trigger)
+  - silent-packet count > SILENT_PACKETS_LIMIT in final voice_rx_rollup
   - active-feeder play stall: nobody playing for > STALL_LIMIT_SECS
-  - bot session not in {transcribed,failed,...} after /stop
+  - /stop errors
 
 Designed to be invoked nightly. Status reported as a final
 JSON line for easy log scraping.
@@ -31,6 +33,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -58,6 +62,18 @@ RSS_GROWTH_LIMIT_MB_PER_HR = int(
     os.environ.get("RSS_GROWTH_LIMIT_MB_PER_HR", "100")
 )
 FD_GROWTH_LIMIT_PER_HR = int(os.environ.get("FD_GROWTH_LIMIT_PER_HR", "50"))
+# Any dave_heal_firing is a failure (the heal path is a correctness
+# patch over a DAVE bug-class; if it runs during a nominally-clean soak,
+# the bot was under distress).
+DAVE_HEAL_FIRED_LIMIT = int(os.environ.get("DAVE_HEAL_FIRED_LIMIT", "0"))
+# Receiver-side consecutive-silent trigger. This fires upstream of the
+# actual leave/rejoin (which may be debounced), so a non-zero rate here
+# with zero fires means the debounce held.
+DAVE_HEAL_REQUEST_LIMIT = int(os.environ.get("DAVE_HEAL_REQUEST_LIMIT", "0"))
+# Silent-packet rollup threshold. 0 matches the README's "silent > 0 in
+# any voice_rx_rollup" intent — bump if DAVE transitions reliably
+# produce a handful of silent ticks and we want to tolerate them.
+SILENT_PACKETS_LIMIT = int(os.environ.get("SILENT_PACKETS_LIMIT", "0"))
 
 # When set, soak.py reads /proc/<pid>/{status,fd} for the bot. When the
 # bot runs in Docker, point this at the host PID (`docker inspect ...`)
@@ -199,6 +215,117 @@ def leave_all() -> None:
             pass
 
 
+# Strip CSI sequences ("\x1b[Nm") emitted by tracing-subscriber's pretty
+# formatter. We only need to parse key=value pairs out of the message body,
+# not pretty-print them.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _parse_kv(line: str, key: str) -> int | None:
+    """Extract an integer field from a pretty-tracing-formatted log line.
+
+    Returns None when the key is absent or not an integer. Kept deliberately
+    forgiving; partial reads shouldn't fail the whole scan.
+    """
+    m = re.search(rf"\b{re.escape(key)}=(-?\d+)", line)
+    return int(m.group(1)) if m else None
+
+
+@dataclass
+class LogScanResult:
+    scanned: bool
+    error: str | None = None
+    heal_fired: int = 0
+    heal_requested: int = 0
+    heal_debounced: int = 0
+    last_rollup_decoded: int | None = None
+    last_rollup_silent: int | None = None
+    last_rollup_unmapped: int | None = None
+    last_rollup_ssrcs: int | None = None
+    rollup_count: int = 0
+
+
+def scan_bot_logs(started_ms: int) -> LogScanResult:
+    """Scrape BOT_CONTAINER's docker logs since `started_ms` for DAVE
+    distress signals and the final voice_rx_rollup snapshot.
+
+    Cheap and blunt: runs once post-teardown rather than streaming. Fine
+    because the rollup counters are monotonic and we only care about the
+    aggregate for the soak window.
+    """
+    if not BOT_CONTAINER:
+        return LogScanResult(scanned=False, error="BOT_CONTAINER not set")
+    since = datetime.fromtimestamp(started_ms / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    try:
+        out = subprocess.check_output(
+            ["docker", "logs", "--since", since, BOT_CONTAINER],
+            stderr=subprocess.STDOUT,
+            timeout=60,
+        ).decode("utf-8", errors="replace")
+    except Exception as e:
+        return LogScanResult(scanned=False, error=str(e))
+
+    result = LogScanResult(scanned=True)
+    for raw in out.splitlines():
+        line = _ANSI_RE.sub("", raw)
+        if "dave_heal_firing" in line:
+            result.heal_fired += 1
+        if "dave_heal_requested" in line:
+            result.heal_requested += 1
+        if "dave_heal_debounced" in line:
+            result.heal_debounced += 1
+        if "voice_rx_rollup" in line:
+            result.rollup_count += 1
+            # Overwrite each iteration so we land on the last rollup.
+            decoded = _parse_kv(line, "decoded")
+            silent = _parse_kv(line, "silent")
+            unmapped = _parse_kv(line, "unmapped")
+            ssrcs = _parse_kv(line, "ssrcs_seen")
+            if decoded is not None:
+                result.last_rollup_decoded = decoded
+            if silent is not None:
+                result.last_rollup_silent = silent
+            if unmapped is not None:
+                result.last_rollup_unmapped = unmapped
+            if ssrcs is not None:
+                result.last_rollup_ssrcs = ssrcs
+    return result
+
+
+def check_log_signals(state: SoakState, scan: LogScanResult) -> None:
+    if not scan.scanned:
+        # Don't fail the soak because we couldn't scrape — but surface it.
+        print(
+            f"log scrape skipped: {scan.error}",
+            file=sys.stderr,
+        )
+        return
+    if scan.heal_fired > DAVE_HEAL_FIRED_LIMIT:
+        state.fail(
+            "dave_heal_fired",
+            f"{scan.heal_fired} heal(s) fired > limit {DAVE_HEAL_FIRED_LIMIT}",
+        )
+    if scan.heal_requested > DAVE_HEAL_REQUEST_LIMIT:
+        state.fail(
+            "dave_heal_requested",
+            f"{scan.heal_requested} heal request(s) > limit "
+            f"{DAVE_HEAL_REQUEST_LIMIT} "
+            f"({scan.heal_debounced} debounced, {scan.heal_fired} fired)",
+        )
+    if (
+        scan.last_rollup_silent is not None
+        and scan.last_rollup_silent > SILENT_PACKETS_LIMIT
+    ):
+        state.fail(
+            "silent_packets",
+            f"final rollup silent={scan.last_rollup_silent} "
+            f"(decoded={scan.last_rollup_decoded}) "
+            f"> limit {SILENT_PACKETS_LIMIT}",
+        )
+
+
 def main() -> int:
     state = SoakState()
     print(f"=== soak start ({DURATION_SECS}s) ===")
@@ -247,7 +374,13 @@ def main() -> int:
     except Exception as e:
         state.fail("stop_failed", str(e))
 
-    report = build_report(state)
+    # Give the bot a beat to flush the final voice_rx_rollup + any
+    # post-teardown log lines before we scrape.
+    time.sleep(6)
+    scan = scan_bot_logs(state.started_ms)
+    check_log_signals(state, scan)
+
+    report = build_report(state, scan)
     print(json.dumps(report, indent=2))
     return 0 if not state.failures else 1
 
@@ -275,9 +408,9 @@ def check_growth_limits(state: SoakState) -> None:
             )
 
 
-def build_report(state: SoakState) -> dict:
+def build_report(state: SoakState, scan: LogScanResult | None = None) -> dict:
     probes = state.probes
-    return {
+    report: dict = {
         "session_id": state.session_id,
         "started_at": datetime.fromtimestamp(
             state.started_ms / 1000, tz=timezone.utc
@@ -294,6 +427,20 @@ def build_report(state: SoakState) -> dict:
         ],
         "ok": not state.failures,
     }
+    if scan is not None:
+        report["log_scan"] = {
+            "scanned": scan.scanned,
+            "error": scan.error,
+            "heal_fired": scan.heal_fired,
+            "heal_requested": scan.heal_requested,
+            "heal_debounced": scan.heal_debounced,
+            "rollup_count": scan.rollup_count,
+            "last_rollup_decoded": scan.last_rollup_decoded,
+            "last_rollup_silent": scan.last_rollup_silent,
+            "last_rollup_unmapped": scan.last_rollup_unmapped,
+            "last_rollup_ssrcs": scan.last_rollup_ssrcs,
+        }
+    return report
 
 
 if __name__ == "__main__":
