@@ -1967,6 +1967,30 @@ async fn send_consent_dms(env: &ActorEnv, session: &Session, session_uuid: uuid:
             Some(uuid) => uuid,
             None => continue, // pre-gate participant, never registered
         };
+
+        // Discord rejects bot-to-bot DMs with 50007 "Cannot send messages to
+        // this user". Skip bot accounts (e.g. harness feeders) so the
+        // `consent_dm_failed` WARN stays signal-only.
+        match p.user_id.to_user(&http).await {
+            Ok(u) if u.bot => {
+                tracing::debug!(
+                    user_id = p.user_id.get(),
+                    display_name = %p.display_name,
+                    "skipping consent DM for bot account"
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    user_id = p.user_id.get(),
+                    error = %e,
+                    "consent_user_lookup_failed"
+                );
+                continue;
+            }
+        }
+
         let pseudo_id = crate::storage::bundle::pseudonymize(p.user_id.get());
 
         // Create the consent token via data-api.
