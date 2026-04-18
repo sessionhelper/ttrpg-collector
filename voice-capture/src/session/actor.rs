@@ -1637,6 +1637,54 @@ async fn apply_enrol(
 // F7 — auto-stop when the channel empties.
 // ---------------------------------------------------------------------------
 
+/// Pure decision: what action should a voice-state change trigger?
+///
+/// Extracted from `apply_voice_state` so the state-transition logic is
+/// unit-testable without constructing an `ActorEnv`.
+///
+/// Rules:
+///   - Bot voice-states: ignore entirely (the bot's own connection).
+///   - Human entering session channel:
+///       - If not yet a participant → EnrolAndTrack (auto-register).
+///       - If already a participant → TrackAsHuman (rejoin / heartbeat).
+///   - Human leaving (any non-session channel or disconnect):
+///       - If participant with no consent yet → ImplicitDeclineAndDrop
+///         (matches `Pending → Decline` rule from `new_carry_forward`;
+///         prevents stabilization from waiting on absent users).
+///       - Otherwise (Accepted, already-Declined, never-enrolled) → Drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceStateAction {
+    Ignore,
+    EnrolAndTrack,
+    TrackAsHuman,
+    Drop,
+    ImplicitDeclineAndDrop,
+}
+
+fn voice_state_transition(
+    participants: &HashMap<UserId, crate::session::ParticipantConsent>,
+    session_channel: ChannelId,
+    new_channel: Option<ChannelId>,
+    user_id: UserId,
+    is_bot: bool,
+) -> VoiceStateAction {
+    if is_bot {
+        return VoiceStateAction::Ignore;
+    }
+    if new_channel == Some(session_channel) {
+        if participants.contains_key(&user_id) {
+            VoiceStateAction::TrackAsHuman
+        } else {
+            VoiceStateAction::EnrolAndTrack
+        }
+    } else {
+        match participants.get(&user_id) {
+            Some(p) if p.scope.is_none() => VoiceStateAction::ImplicitDeclineAndDrop,
+            _ => VoiceStateAction::Drop,
+        }
+    }
+}
+
 async fn apply_voice_state(
     env: &mut ActorEnv,
     session: &mut Session,
@@ -1646,29 +1694,39 @@ async fn apply_voice_state(
     is_bot: bool,
     display_name: String,
 ) {
-    if is_bot {
-        return;
-    }
     let session_channel = ChannelId::new(session.channel_id);
-    if new_channel == Some(session_channel) {
-        env.humans_in_channel.insert(user_id);
-        // Auto-enrol on voice-channel entry. Covers two flows:
-        //   1. Harness /record: session spawns with empty participants,
-        //      feeders join after; they need to be enrolled here or their
-        //      audio has no routing target and gets dropped at the sink.
-        //   2. Slash /record: invoker + present members are pre-enrolled,
-        //      but late joiners (someone connects mid-session) need to be
-        //      captured with pending-consent state, same as if they'd been
-        //      in the channel at /record time.
-        // Skip if already enrolled (re-joins after a momentary disconnect
-        // would otherwise create duplicate participant rows).
-        if !session.participants.contains_key(&user_id)
-            && let Err(e) = apply_enrol(env, session, user_id, display_name).await
-        {
-            warn!(%user_id, error = ?e, "auto_enrol_on_voice_join_failed");
+    let action = voice_state_transition(
+        &session.participants,
+        session_channel,
+        new_channel,
+        user_id,
+        is_bot,
+    );
+    match action {
+        VoiceStateAction::Ignore => return,
+        VoiceStateAction::EnrolAndTrack => {
+            env.humans_in_channel.insert(user_id);
+            if let Err(e) = apply_enrol(env, session, user_id, display_name).await {
+                warn!(%user_id, error = ?e, "auto_enrol_on_voice_join_failed");
+            }
         }
-    } else {
-        env.humans_in_channel.remove(&user_id);
+        VoiceStateAction::TrackAsHuman => {
+            env.humans_in_channel.insert(user_id);
+        }
+        VoiceStateAction::Drop => {
+            env.humans_in_channel.remove(&user_id);
+        }
+        VoiceStateAction::ImplicitDeclineAndDrop => {
+            env.humans_in_channel.remove(&user_id);
+            if let Some(p) = session.participants.get_mut(&user_id) {
+                p.scope = Some(ConsentScope::Decline);
+                p.state = ParticipantState::Declined;
+            }
+            if let Ok(mut g) = env.expected_user_ids.lock() {
+                g.remove(&user_id.get());
+            }
+            info!(%user_id, "implicit_decline_on_voice_leave (was pending)");
+        }
     }
     recompute_humans_and_auto_stop_timer(env, session);
 }
@@ -1970,6 +2028,148 @@ async fn send_consent_dms(env: &ActorEnv, session: &Session, session_uuid: uuid:
 mod tests {
     use super::*;
     use crate::session::ConsentScope;
+
+    // ----- voice_state_transition (pure decision) --------------------------
+
+    fn pc_pending(uid: UserId) -> crate::session::ParticipantConsent {
+        crate::session::ParticipantConsent::new(uid, "test".into(), false)
+    }
+
+    fn pc_accepted(uid: UserId) -> crate::session::ParticipantConsent {
+        let mut p = pc_pending(uid);
+        p.scope = Some(ConsentScope::Full);
+        p.state = crate::session::ParticipantState::Accepted;
+        p
+    }
+
+    fn pc_declined(uid: UserId) -> crate::session::ParticipantConsent {
+        let mut p = pc_pending(uid);
+        p.scope = Some(ConsentScope::Decline);
+        p.state = crate::session::ParticipantState::Declined;
+        p
+    }
+
+    #[test]
+    fn voice_transition_ignores_bots() {
+        let ps: HashMap<UserId, _> = HashMap::new();
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            Some(ChannelId::new(100)),
+            UserId::new(1),
+            true, // is_bot
+        );
+        assert_eq!(action, VoiceStateAction::Ignore);
+    }
+
+    #[test]
+    fn voice_transition_enrols_new_human_on_entry() {
+        let ps: HashMap<UserId, _> = HashMap::new();
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            Some(ChannelId::new(100)),
+            UserId::new(42),
+            false,
+        );
+        assert_eq!(action, VoiceStateAction::EnrolAndTrack);
+    }
+
+    #[test]
+    fn voice_transition_tracks_returning_human_without_reenrol() {
+        // User was a participant before — probably left and is now back.
+        // Don't double-enrol; just mark them present again.
+        let mut ps = HashMap::new();
+        ps.insert(UserId::new(42), pc_accepted(UserId::new(42)));
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            Some(ChannelId::new(100)),
+            UserId::new(42),
+            false,
+        );
+        assert_eq!(action, VoiceStateAction::TrackAsHuman);
+    }
+
+    #[test]
+    fn voice_transition_ignores_human_in_different_channel() {
+        // User joined a voice channel that ISN'T the session channel.
+        // We're not recording them; drop from tracking but nothing to decline.
+        let ps: HashMap<UserId, _> = HashMap::new();
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            Some(ChannelId::new(999)),
+            UserId::new(42),
+            false,
+        );
+        assert_eq!(action, VoiceStateAction::Drop);
+    }
+
+    #[test]
+    fn voice_transition_implicit_declines_pending_on_exit() {
+        // User was auto-enrolled (Pending), never consented, now leaves.
+        // Must be implicit-declined so stabilization doesn't wait on them.
+        let mut ps = HashMap::new();
+        ps.insert(UserId::new(42), pc_pending(UserId::new(42)));
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            None, // disconnected
+            UserId::new(42),
+            false,
+        );
+        assert_eq!(action, VoiceStateAction::ImplicitDeclineAndDrop);
+    }
+
+    #[test]
+    fn voice_transition_preserves_accepted_on_exit() {
+        // User accepted, then left. Their audio so far is still valid.
+        // Drop tracking but don't overwrite their consent.
+        let mut ps = HashMap::new();
+        ps.insert(UserId::new(42), pc_accepted(UserId::new(42)));
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            None,
+            UserId::new(42),
+            false,
+        );
+        assert_eq!(action, VoiceStateAction::Drop);
+    }
+
+    #[test]
+    fn voice_transition_noop_when_already_declined_and_exiting() {
+        // User declined, then left. No state change needed.
+        let mut ps = HashMap::new();
+        ps.insert(UserId::new(42), pc_declined(UserId::new(42)));
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            None,
+            UserId::new(42),
+            false,
+        );
+        assert_eq!(action, VoiceStateAction::Drop);
+    }
+
+    #[test]
+    fn voice_transition_switching_voice_channels_drops_pending() {
+        // User was in session channel (Pending), moved to a different channel.
+        // Same as a disconnect: implicit-decline.
+        let mut ps = HashMap::new();
+        ps.insert(UserId::new(42), pc_pending(UserId::new(42)));
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            Some(ChannelId::new(999)),
+            UserId::new(42),
+            false,
+        );
+        assert_eq!(action, VoiceStateAction::ImplicitDeclineAndDrop);
+    }
+
+    // ----- session error enum ----------------------------------------------
 
     #[test]
     fn session_error_variants_have_distinct_messages() {
