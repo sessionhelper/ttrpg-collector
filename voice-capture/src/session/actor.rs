@@ -1642,13 +1642,20 @@ async fn apply_enrol(
 /// Extracted from `apply_voice_state` so the state-transition logic is
 /// unit-testable without constructing an `ActorEnv`.
 ///
+/// The `is_self_bot` parameter means *this voice-state is about our own
+/// bot* (we joined / left voice). It does NOT mean "this account has
+/// Discord's bot flag set"; other bot accounts (harness feeders,
+/// multi-bot collaborations) are legitimate users whose audio we must
+/// capture. The caller computes this via `user_id == ctx.cache.current_user().id`
+/// before sending the `SessionCmd::VoiceStateChange`.
+///
 /// Rules:
-///   - Bot voice-states: ignore entirely (the bot's own connection).
-///   - Human entering session channel:
+///   - Self-bot voice-state: Ignore entirely.
+///   - User entering session channel:
 ///       - If not yet a participant → EnrolAndTrack (auto-register).
 ///       - If already a participant → TrackAsHuman (rejoin / heartbeat).
-///   - Human leaving (any non-session channel or disconnect):
-///       - If participant with no consent yet → ImplicitDeclineAndDrop
+///   - User leaving (any non-session channel or disconnect):
+///       - Participant with no consent yet → ImplicitDeclineAndDrop
 ///         (matches `Pending → Decline` rule from `new_carry_forward`;
 ///         prevents stabilization from waiting on absent users).
 ///       - Otherwise (Accepted, already-Declined, never-enrolled) → Drop.
@@ -1666,9 +1673,9 @@ fn voice_state_transition(
     session_channel: ChannelId,
     new_channel: Option<ChannelId>,
     user_id: UserId,
-    is_bot: bool,
+    is_self_bot: bool,
 ) -> VoiceStateAction {
-    if is_bot {
+    if is_self_bot {
         return VoiceStateAction::Ignore;
     }
     if new_channel == Some(session_channel) {
@@ -2050,14 +2057,19 @@ mod tests {
     }
 
     #[test]
-    fn voice_transition_ignores_bots() {
+    fn voice_transition_ignores_self_bot_voice_state() {
+        // `is_self_bot=true` means this voice-state is about OUR OWN bot
+        // joining/leaving voice — we don't enrol ourselves as a participant.
+        // Other bot accounts (feeders, multi-bot collabs) are NOT self;
+        // they get `is_self_bot=false` from the dispatcher and flow through
+        // the normal enrol path.
         let ps: HashMap<UserId, _> = HashMap::new();
         let action = voice_state_transition(
             &ps,
             ChannelId::new(100),
             Some(ChannelId::new(100)),
             UserId::new(1),
-            true, // is_bot
+            true, // is_self_bot
         );
         assert_eq!(action, VoiceStateAction::Ignore);
     }
@@ -2071,6 +2083,27 @@ mod tests {
             Some(ChannelId::new(100)),
             UserId::new(42),
             false,
+        );
+        assert_eq!(action, VoiceStateAction::EnrolAndTrack);
+    }
+
+    #[test]
+    fn voice_transition_enrols_non_self_bot_on_entry() {
+        // Regression guard for the Attempt-3 DAVE test finding:
+        // a non-self bot account (harness feeder, or any other Discord bot
+        // that happens to be in the session channel) must flow through
+        // EnrolAndTrack. Previously `is_bot=true` was sent for ALL Discord
+        // bot accounts, causing their audio to be dropped at the sink.
+        // Now the dispatcher only sets the flag when user_id == own bot's
+        // id, so this case arrives here as `is_self_bot=false`.
+        let ps: HashMap<UserId, _> = HashMap::new();
+        let feeder_user_id = UserId::new(1490405412917215463); // moe feeder
+        let action = voice_state_transition(
+            &ps,
+            ChannelId::new(100),
+            Some(ChannelId::new(100)),
+            feeder_user_id,
+            false, // dispatcher computed: not our own bot
         );
         assert_eq!(action, VoiceStateAction::EnrolAndTrack);
     }

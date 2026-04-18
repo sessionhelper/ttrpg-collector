@@ -31,7 +31,15 @@ pub async fn handle_voice_state_update(
         None => return,
     };
 
-    let is_bot = guild.members.get(&new.user_id).is_some_and(|m| m.user.bot);
+    // `is_bot` here means "is this voice-state event about OUR OWN bot"
+    // — i.e. something the session actor should ignore (our own join
+    // when we enter voice, our own leave on finalize). It does NOT mean
+    // "this user account has Discord's bot flag set"; other Discord bot
+    // accounts (including the harness feeder fleet) are legitimate test
+    // users whose audio we need to capture, so they must flow through
+    // the normal auto-enrol path. Matching on our own user_id is the
+    // only condition that warrants ignoring a voice-state.
+    let is_bot = new.user_id == ctx.cache.current_user().id;
     let display_name = guild
         .members
         .get(&new.user_id)
