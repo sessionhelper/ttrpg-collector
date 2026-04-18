@@ -1639,12 +1639,12 @@ async fn apply_enrol(
 
 async fn apply_voice_state(
     env: &mut ActorEnv,
-    session: &Session,
+    session: &mut Session,
     _old_channel: Option<ChannelId>,
     new_channel: Option<ChannelId>,
     user_id: UserId,
     is_bot: bool,
-    _display_name: String,
+    display_name: String,
 ) {
     if is_bot {
         return;
@@ -1652,6 +1652,21 @@ async fn apply_voice_state(
     let session_channel = ChannelId::new(session.channel_id);
     if new_channel == Some(session_channel) {
         env.humans_in_channel.insert(user_id);
+        // Auto-enrol on voice-channel entry. Covers two flows:
+        //   1. Harness /record: session spawns with empty participants,
+        //      feeders join after; they need to be enrolled here or their
+        //      audio has no routing target and gets dropped at the sink.
+        //   2. Slash /record: invoker + present members are pre-enrolled,
+        //      but late joiners (someone connects mid-session) need to be
+        //      captured with pending-consent state, same as if they'd been
+        //      in the channel at /record time.
+        // Skip if already enrolled (re-joins after a momentary disconnect
+        // would otherwise create duplicate participant rows).
+        if !session.participants.contains_key(&user_id)
+            && let Err(e) = apply_enrol(env, session, user_id, display_name).await
+        {
+            warn!(%user_id, error = ?e, "auto_enrol_on_voice_join_failed");
+        }
     } else {
         env.humans_in_channel.remove(&user_id);
     }
@@ -1882,7 +1897,7 @@ async fn send_consent_dms(env: &ActorEnv, session: &Session, session_uuid: uuid:
     let api = env.state.api.clone();
     let http = env.ctx.http.clone();
 
-    for (_, p) in &session.participants {
+    for p in session.participants.values() {
         let participant_uuid = match p.participant_uuid {
             Some(uuid) => uuid,
             None => continue, // pre-gate participant, never registered

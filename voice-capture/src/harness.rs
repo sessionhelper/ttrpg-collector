@@ -336,6 +336,7 @@ mod tests {
             harness_enabled,
             harness_port: 8010,
             harness_bind: "127.0.0.1".parse().unwrap(),
+            portal_url: "http://127.0.0.1:3000".into(),
         }
     }
 

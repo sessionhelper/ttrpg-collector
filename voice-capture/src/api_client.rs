@@ -863,9 +863,14 @@ impl DataApiClient {
 }
 
 /// Response from POST /internal/consent-tokens.
+///
+/// `expires_at` is included for logging/debugging; callers use the
+/// token itself to build the portal URL and don't enforce TTL on the
+/// bot side (the portal validates at redeem time).
 #[derive(Debug, Deserialize)]
 pub struct ConsentTokenResponse {
     pub token: Uuid,
+    #[allow(dead_code)]
     pub expires_at: DateTime<Utc>,
 }
 
