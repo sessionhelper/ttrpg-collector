@@ -294,9 +294,10 @@ def run_scenario(scenario_id: str) -> dict:
     except Exception as e:
         fail("stop_failed", str(e))
 
-    # 7. Log scan for this scenario's window. Use the silent-packet delta
-    #    inside the window rather than the absolute counter, because
-    #    AudioReceiver counters persist across /record sessions.
+    # 7. Log scan for this scenario's window. The silent-rollup count
+    #    (how many rollups during this window reported silent>0) is the
+    #    per-window signal; absolute counters are cumulative and not
+    #    session-scoped, so we can't easily delta them.
     time.sleep(6)
     scan = soak.scan_bot_logs(started_ms)
     if scan.scanned:
@@ -305,12 +306,11 @@ def run_scenario(scenario_id: str) -> dict:
                 "dave_heal_fired",
                 f"{scan.heal_fired} heal(s) during {scenario_id}",
             )
-        silent_delta = scan.silent_delta
-        if silent_delta is not None and silent_delta > 0:
+        if scan.silent_rollup_count > 0:
             fail(
                 "silent_packets",
-                f"silent-packet delta {silent_delta} in {scenario_id} "
-                f"(decoded delta {scan.decoded_delta})",
+                f"{scan.silent_rollup_count} rollup(s) with silent>0 "
+                f"in {scenario_id} (peak={scan.silent_max})",
             )
 
     return _build_scenario_report(
@@ -338,11 +338,7 @@ def _build_scenario_report(
         "ok": not failures,
     }
     if scan is not None:
-        report["log_scan"] = {
-            **{k: v for k, v in asdict(scan).items()},
-            "decoded_delta": scan.decoded_delta,
-            "silent_delta": scan.silent_delta,
-        }
+        report["log_scan"] = asdict(scan)
     return report
 
 

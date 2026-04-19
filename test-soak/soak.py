@@ -238,29 +238,19 @@ class LogScanResult:
     heal_fired: int = 0
     heal_requested: int = 0
     heal_debounced: int = 0
-    # Absolute counter values from the first + last rollup inside the
-    # scan window. Counters are monotonic since AudioReceiver construction
-    # (which may live longer than one /record session), so deltas are what
-    # describe this soak window specifically.
-    first_rollup_decoded: int | None = None
-    first_rollup_silent: int | None = None
-    last_rollup_decoded: int | None = None
-    last_rollup_silent: int | None = None
-    last_rollup_unmapped: int | None = None
-    last_rollup_ssrcs: int | None = None
     rollup_count: int = 0
-
-    @property
-    def decoded_delta(self) -> int | None:
-        if self.first_rollup_decoded is None or self.last_rollup_decoded is None:
-            return None
-        return self.last_rollup_decoded - self.first_rollup_decoded
-
-    @property
-    def silent_delta(self) -> int | None:
-        if self.first_rollup_silent is None or self.last_rollup_silent is None:
-            return None
-        return self.last_rollup_silent - self.first_rollup_silent
+    # Count of rollup lines inside the window with silent > 0. Match the
+    # README's "silent > 0 in any voice_rx_rollup" intent. Counting rather
+    # than summing absolute values, because multiple AudioReceivers can
+    # overlap briefly during /stop → /record transitions and the absolute
+    # counters aren't per-session — but a non-zero `silent` on any rollup
+    # means packets went silent at that moment.
+    silent_rollup_count: int = 0
+    silent_max: int = 0
+    # Max "decoded" seen across any rollup in the window. Sanity signal
+    # that we captured *some* audio; useful for confirming scenarios that
+    # should have produced frames actually did.
+    peak_decoded: int = 0
 
 
 def scan_bot_logs(started_ms: int) -> LogScanResult:
@@ -298,24 +288,12 @@ def scan_bot_logs(started_ms: int) -> LogScanResult:
             result.rollup_count += 1
             decoded = _parse_kv(line, "decoded")
             silent = _parse_kv(line, "silent")
-            unmapped = _parse_kv(line, "unmapped")
-            ssrcs = _parse_kv(line, "ssrcs_seen")
-            # Record the first rollup in the window as the baseline;
-            # subsequent rollups overwrite `last_*` so we land on the
-            # final state. decoded_delta/silent_delta then describe only
-            # this soak window.
-            if result.first_rollup_decoded is None and decoded is not None:
-                result.first_rollup_decoded = decoded
-            if result.first_rollup_silent is None and silent is not None:
-                result.first_rollup_silent = silent
-            if decoded is not None:
-                result.last_rollup_decoded = decoded
-            if silent is not None:
-                result.last_rollup_silent = silent
-            if unmapped is not None:
-                result.last_rollup_unmapped = unmapped
-            if ssrcs is not None:
-                result.last_rollup_ssrcs = ssrcs
+            if decoded is not None and decoded > result.peak_decoded:
+                result.peak_decoded = decoded
+            if silent is not None and silent > 0:
+                result.silent_rollup_count += 1
+                if silent > result.silent_max:
+                    result.silent_max = silent
     return result
 
 
@@ -339,16 +317,16 @@ def check_log_signals(state: SoakState, scan: LogScanResult) -> None:
             f"{DAVE_HEAL_REQUEST_LIMIT} "
             f"({scan.heal_debounced} debounced, {scan.heal_fired} fired)",
         )
-    # Compare the delta inside the scan window, not the absolute cumulative
-    # counter — AudioReceiver can outlive a single /record session so the
-    # absolute number reflects the bot's lifetime, not this soak.
-    silent_delta = scan.silent_delta
-    if silent_delta is not None and silent_delta > SILENT_PACKETS_LIMIT:
+    # Count rollups whose `silent` field was non-zero at snapshot time.
+    # The README intent is "silent > 0 in any voice_rx_rollup" — counting
+    # rollups sidesteps the cumulative-counter issue (multiple AudioReceivers
+    # can overlap across /stop → /record transitions, so absolute silent
+    # numbers aren't session-scoped).
+    if scan.silent_rollup_count > SILENT_PACKETS_LIMIT:
         state.fail(
             "silent_packets",
-            f"silent-packet delta {silent_delta} "
-            f"(decoded delta {scan.decoded_delta}) "
-            f"> limit {SILENT_PACKETS_LIMIT}",
+            f"{scan.silent_rollup_count} rollup(s) with silent>0 "
+            f"(peak={scan.silent_max}) > limit {SILENT_PACKETS_LIMIT}",
         )
 
 
